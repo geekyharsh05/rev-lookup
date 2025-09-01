@@ -7,13 +7,23 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import time
 import os
+import json
+import re
 
 options = ChromeOptions()
 
+# Enable logging to capture network requests
+options.add_argument("--enable-logging")
+options.add_argument("--log-level=0")
+options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+
+# OUTLOOK_EMAIL="harshisbest1@outlook.com"
+# OUTLOOK_PASSWORD="I9jcdbma9k@"
+
 # Read credentials from environment variables
 # Primary: OUTLOOK_EMAIL / OUTLOOK_PASSWORD; Fallback: EMAIL / PASSWORD
-OUTLOOK_EMAIL = os.getenv("OUTLOOK_EMAIL") or os.getenv("EMAIL")
-OUTLOOK_PASSWORD = os.getenv("OUTLOOK_PASSWORD") or os.getenv("PASSWORD")
+OUTLOOK_EMAIL = os.getenv("OUTLOOK_EMAIL") or "harshisbest1@outlook.com"
+OUTLOOK_PASSWORD = os.getenv("OUTLOOK_PASSWORD") or "I9jcdbma9k@"
 
 # Persist session data (cookies, storage) by using a dedicated user data directory
 profile_dir = os.path.join(os.getcwd(), "chrome_profile")
@@ -192,6 +202,309 @@ def find_next_button():
         pass
     
     return None
+
+
+def extract_bearer_token():
+    """Extract Bearer token from browser session"""
+    try:
+        print("Extracting Bearer token...")
+        
+        # Method 1: Check localStorage
+        try:
+            local_storage = browser.execute_script("return localStorage;")
+            for key, value in local_storage.items():
+                if 'token' in key.lower() or 'auth' in key.lower():
+                    if isinstance(value, str) and ('Bearer' in value or 'eyJ' in value):
+                        print(f"Found token in localStorage['{key}']")
+                        return value if value.startswith('Bearer') else f'Bearer {value}'
+        except Exception as e:
+            print(f"localStorage check failed: {e}")
+        
+        # Method 2: Check sessionStorage
+        try:
+            session_storage = browser.execute_script("return sessionStorage;")
+            for key, value in session_storage.items():
+                if 'token' in key.lower() or 'auth' in key.lower():
+                    if isinstance(value, str) and ('Bearer' in value or 'eyJ' in value):
+                        print(f"Found token in sessionStorage['{key}']")
+                        return value if value.startswith('Bearer') else f'Bearer {value}'
+        except Exception as e:
+            print(f"sessionStorage check failed: {e}")
+        
+        # Method 3: Intercept network requests
+        try:
+            print("Navigating to Outlook to capture network requests...")
+            browser.get('https://outlook.live.com/mail/0/')
+            time.sleep(5)
+            
+            # Get browser logs
+            logs = browser.get_log('performance')
+            for log in logs:
+                message = json.loads(log['message'])
+                if message['message']['method'] == 'Network.requestWillBeSent':
+                    headers = message['message']['params'].get('request', {}).get('headers', {})
+                    auth_header = headers.get('Authorization') or headers.get('authorization')
+                    if auth_header and auth_header.startswith('Bearer'):
+                        print("Found Bearer token in network request")
+                        return auth_header
+        except Exception as e:
+            print(f"Network interception failed: {e}")
+        
+        # Method 4: Execute script to make a test API call and capture token
+        try:
+            print("Attempting to capture token from API call...")
+            script = """
+            // Try to find and return any Bearer token from the page context
+            const authToken = window.localStorage.getItem('authToken') || 
+                             window.localStorage.getItem('AccessToken') ||
+                             window.localStorage.getItem('msal.token') ||
+                             window.sessionStorage.getItem('authToken') ||
+                             window.sessionStorage.getItem('AccessToken');
+            
+            if (authToken) {
+                return authToken.startsWith('Bearer') ? authToken : 'Bearer ' + authToken;
+            }
+            
+            // Try to extract from any global variables
+            if (window.OWA && window.OWA.config && window.OWA.config.authToken) {
+                return 'Bearer ' + window.OWA.config.authToken;
+            }
+            
+            return null;
+            """
+            
+            token = browser.execute_script(script)
+            if token:
+                print("Found token from page context")
+                return token
+                
+        except Exception as e:
+            print(f"Script execution failed: {e}")
+        
+        # Method 5: Make a test request to capture the token
+        try:
+            print("Making test request to capture authorization header...")
+            script = """
+            return new Promise((resolve) => {
+                const originalFetch = window.fetch;
+                let capturedToken = null;
+                
+                window.fetch = function(...args) {
+                    const [url, options] = args;
+                    if (options && options.headers && options.headers.authorization) {
+                        capturedToken = options.headers.authorization;
+                    }
+                    return originalFetch.apply(this, args);
+                };
+                
+                // Make a test request
+                fetch('/api/v1/me', {
+                    headers: {
+                        'Accept': 'application/json'
+                    }
+                }).then(() => {
+                    window.fetch = originalFetch;
+                    resolve(capturedToken);
+                }).catch(() => {
+                    window.fetch = originalFetch;
+                    resolve(capturedToken);
+                });
+                
+                // Timeout fallback
+                setTimeout(() => {
+                    window.fetch = originalFetch;
+                    resolve(capturedToken);
+                }, 5000);
+            });
+            """
+            
+            token = browser.execute_async_script(script)
+            if token:
+                print("Captured token from intercepted request")
+                return token
+                
+        except Exception as e:
+            print(f"Request interception failed: {e}")
+        
+        print("❌ Could not extract Bearer token")
+        return None
+        
+    except Exception as e:
+        print(f"Error extracting Bearer token: {e}")
+        return None
+
+
+def login_and_get_token():
+    """Login to Outlook and extract Bearer token"""
+    token = None
+    try:
+        browser.get('https://outlook.live.com/owa/logoff.owa')
+        browser.get('https://login.live.com/login.srf')
+        
+        # Wait for page to load and username field to appear
+        print("Waiting for login page to load...")
+        username = wait_for_element(By.XPATH, "//input[@id='i0116']")
+        if not username:
+            print("Username field not found. Trying alternative selector...")
+            # Try alternative selectors in case Microsoft changed the page
+            username = wait_for_element(By.NAME, "loginfmt") or \
+                      wait_for_element(By.CSS_SELECTOR, "input[type='email']") or \
+                      wait_for_element(By.XPATH, "//input[@type='email']")
+        
+        if not username:
+            raise Exception("Could not find username field")
+            
+        username.clear()
+        if not OUTLOOK_EMAIL:
+            raise Exception("Missing environment variable: set OUTLOOK_EMAIL (or EMAIL)")
+        username.send_keys(OUTLOOK_EMAIL)
+        print("Username entered successfully")
+
+        # Wait a moment for the page to update after entering username
+        time.sleep(2)
+
+        # Wait for next button and click it
+        print("Looking for next button...")
+        next_button = find_next_button()
+        
+        if not next_button:
+            print("Next button not found. Taking screenshot for debugging...")
+            # Take a screenshot to help debug
+            browser.save_screenshot("login_page_debug.png")
+            print("Screenshot saved as 'login_page_debug.png'")
+            
+            # Debug all page elements
+            debug_page_elements()
+            
+            # Print page source for debugging
+            print("Page source preview:")
+            print(browser.page_source[:2000])
+            
+            raise Exception("Could not find next button after trying all strategies")
+            
+        print(f"Next button found: {next_button.tag_name} - {next_button.text}")
+        next_button.click()
+        print("Next button clicked")
+        time.sleep(3)
+
+        # Wait for password field to appear
+        print("Waiting for password field...")
+        password = wait_for_element(By.XPATH, "//input[@id='i0118']")
+        if not password:
+            print("Password field not found. Trying alternative selector...")
+            password = wait_for_element(By.NAME, "passwd") or \
+                      wait_for_element(By.CSS_SELECTOR, "input[type='password']") or \
+                      wait_for_element(By.XPATH, "//input[@type='password']")
+        
+        if not password:
+            raise Exception("Could not find password field")
+            
+        # Try to enable the password field if needed
+        try:
+            browser.execute_script("document.getElementById('i0118').setAttribute('class', 'form-control')")
+        except:
+            pass  # Ignore if this fails
+            
+        password.clear()
+        if not OUTLOOK_PASSWORD:
+            raise Exception("Missing environment variable: set OUTLOOK_PASSWORD (or PASSWORD)")
+        password.send_keys(OUTLOOK_PASSWORD)
+        print("Password entered successfully")
+
+        # Try to enable signin button if needed
+        try:
+            browser.execute_script("document.getElementById('idSIButton9').disabled=false")
+        except:
+            pass  # Ignore if this fails
+            
+        # Wait for and click signin button
+        print("Looking for signin button...")
+        signin_button = wait_for_element(By.ID, 'idSIButton9')
+        if not signin_button:
+            print("Signin button not found by ID. Trying alternative selectors...")
+            # Try multiple strategies to find the signin button
+            signin_button = (
+                wait_for_element(By.XPATH, "//input[@type='submit']") or
+                wait_for_element(By.CSS_SELECTOR, "input[type='submit']") or
+                wait_for_element(By.XPATH, "//button[@type='submit']") or
+                wait_for_element(By.XPATH, "//button[contains(text(), 'Sign in')]") or
+                wait_for_element(By.XPATH, "//button[contains(text(), 'Sign In')]") or
+                wait_for_element(By.XPATH, "//button[contains(text(), 'Signin')]") or
+                wait_for_element(By.XPATH, "//input[@value='Sign in']") or
+                wait_for_element(By.XPATH, "//input[@value='Sign In']") or
+                wait_for_element(By.XPATH, "//button[contains(@aria-label, 'Sign in')]") or
+                wait_for_element(By.XPATH, "//button[contains(@aria-label, 'Sign In')]")
+            )
+        
+        if not signin_button:
+            print("Signin button not found after trying all strategies. Taking screenshot...")
+            browser.save_screenshot("signin_page_debug.png")
+            print("Screenshot saved as 'signin_page_debug.png'")
+            
+            # Debug all page elements
+            debug_page_elements()
+            
+            print("Page source preview:")
+            print(browser.page_source[:2000])
+            raise Exception("Could not find signin button")
+            
+        signin_button.click()
+        print("Signin button clicked")
+
+        # Wait for and handle the "Stay signed in?" dialog - CLICK YES
+        try:
+            # Detect the prompt
+            prompt = WebDriverWait(browser, 5).until(
+                EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Stay signed in') or contains(text(), 'Stay signed in?') or contains(text(), 'Keep me signed in')]"))
+            )
+            # Try common selectors for the YES/primary button
+            yes_selectors = [
+                (By.ID, 'idSIButton9'),
+                (By.CSS_SELECTOR, "button[data-testid='primaryButton']"),
+                (By.XPATH, "//button[contains(text(), 'Yes')]")
+            ]
+            clicked_yes = False
+            for by, sel in yes_selectors:
+                try:
+                    btn = WebDriverWait(browser, 5).until(EC.element_to_be_clickable((by, sel)))
+                    btn.click()
+                    print("Clicked 'Yes' on Stay signed in prompt")
+                    clicked_yes = True
+                    break
+                except Exception:
+                    continue
+            if not clicked_yes:
+                # Fallback: press Enter which usually activates the primary action (Yes)
+                try:
+                    browser.switch_to.active_element.send_keys("\n")
+                    print("Pressed Enter to confirm 'Yes'")
+                except Exception:
+                    print("Could not auto-confirm 'Yes'")
+        except Exception:
+            print("No stay signed in dialog found or already handled")
+
+        # Navigate to inbox and extract token
+        print("Navigating to inbox...")
+        browser.get(r'https://outlook.live.com/mail/0/')
+        
+        # Wait for inbox to load
+        print("Waiting for inbox to load...")
+        time.sleep(10)
+        
+        # Extract Bearer token
+        token = extract_bearer_token()
+        
+        if token:
+            print("✅ Successfully extracted Bearer token!")
+            print(f"Token (first 50 chars): {token[:50]}...")
+        else:
+            print("❌ Failed to extract Bearer token")
+        
+        return token
+        
+    except Exception as e:
+        print(f"Error during login: {str(e)}")
+        return None
 
 
 def login():
