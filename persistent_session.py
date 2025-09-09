@@ -428,7 +428,7 @@ class PersistentOutlookSession:
     
     def start_persistent_session(self):
         """Start the persistent session"""
-        print("🚀 Starting persistent Outlook session...")
+        print(" Starting persistent Outlook session...")
         
         # Setup browser
         if not self.initialize_browser():

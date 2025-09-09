@@ -11,7 +11,12 @@ from datetime import datetime
 import threading
 from persistent_session import get_session_manager, start_persistent_session, get_bearer_token
 from token_manager import get_token_manager, get_valid_token
+from dynamodb_manager import get_dynamodb_manager, initialize_dynamodb_manager
 import tempfile
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 app = FastAPI(
     title="LinkedIn Profile Extractor API",
@@ -31,6 +36,7 @@ app.add_middleware(
 # Global variables to store session state
 session_started: bool = False
 startup_lock = threading.Lock()
+dynamodb_initialized: bool = False
 
 class LinkedInProfileExtractor:
     def __init__(self, auth_token: str):
@@ -86,7 +92,7 @@ async def ensure_session_started():
     if not session_started:
         with startup_lock:
             if not session_started:  # Double-check locking
-                print("🚀 Starting persistent Outlook session...")
+                print("Starting persistent Outlook session...")
                 
                 # Run session startup in thread executor
                 loop = asyncio.get_event_loop()
@@ -97,6 +103,41 @@ async def ensure_session_started():
                     print("✅ Persistent session started successfully!")
                 else:
                     raise HTTPException(status_code=503, detail="Failed to start persistent session")
+    
+    return True
+
+async def ensure_dynamodb_initialized():
+    """Ensure DynamoDB is initialized with credentials"""
+    global dynamodb_initialized
+    
+    if not dynamodb_initialized:
+        try:
+            # Get credentials from environment variables
+            aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+            aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+            aws_region = os.getenv('AWS_REGION', 'us-east-1')
+            table_name = os.getenv('DYNAMODB_TABLE_NAME', 'linkedin_profiles')
+            
+            if not aws_access_key_id or not aws_secret_access_key:
+                print("⚠️  AWS credentials not found in environment variables")
+                print("   Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+                return False
+            
+            # Initialize DynamoDB manager
+            initialize_dynamodb_manager(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=aws_region,
+                table_name=table_name
+            )
+            
+            dynamodb_initialized = True
+            print("✅ DynamoDB initialized successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize DynamoDB: {str(e)}")
+            return False
     
     return True
 
@@ -159,12 +200,9 @@ async def root():
         "message": "LinkedIn Profile Extractor API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /profile/{email}": "Get LinkedIn profile for email",
             "POST /profile": "Get LinkedIn profile for single email (body: {email: 'user@example.com'})",
-            "POST /profiles/batch": "Get LinkedIn profiles for multiple emails (body: {emails: [...], delay_seconds: 2})",
-            "POST /profiles/batch/enhanced": "Enhanced batch processing with progress tracking",
-            "POST /profile/download": "Download single LinkedIn profile (body: {email: 'user@example.com'})",
-            "POST /profiles/batch/download": "Download multiple LinkedIn profiles (body: {emails: [...], delay_seconds: 2})",
+            "POST /profiles/batch": "Batch processing with progress tracking (body: {emails: [...], delay_seconds: 2, stop_on_error: true, save_individual_files: false, save_to_dynamodb: true, long_break_interval: 10, long_break_duration: 10})",
+            "POST /profile/download": "Download single LinkedIn profile as JSON file (body: {email: 'user@example.com'})",
             "GET /health": "Health check",
             "GET /token/status": "Check token status",
             "POST /token/refresh": "Force token refresh (may open browser)",
@@ -180,7 +218,8 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "session_started": session_started,
         "session_active": manager.is_logged_in if manager else False,
-        "token_available": get_bearer_token() is not None
+        "token_available": get_bearer_token() is not None,
+        "dynamodb_initialized": dynamodb_initialized
     }
 
 @app.get("/token/status")
@@ -264,10 +303,15 @@ async def manual_token_upload(request: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Manual token upload failed: {str(e)}")
 
-@app.get("/profile/{email}")
-async def get_linkedin_profile(email: str):
+@app.post("/profile")
+async def get_linkedin_profile(request: dict):
     """Get LinkedIn profile for a single email"""
     try:
+        # Extract email from request body
+        email = request.get("email")
+        if not email:
+            raise HTTPException(status_code=400, detail="Email is required in request body")
+        
         # Get fresh token
         token = await get_fresh_token()
         
@@ -289,78 +333,6 @@ async def get_linkedin_profile(email: str):
 
 @app.post("/profiles/batch")
 async def get_linkedin_profiles_batch(request: dict):
-    """Get LinkedIn profiles for multiple emails"""
-    try:
-        # Extract emails and delay from request body
-        emails = request.get("emails", [])
-        delay_seconds = request.get("delay_seconds", 2)
-        
-        if not emails:
-            raise HTTPException(status_code=400, detail="emails array is required in request body")
-        
-        # if len(emails) > 50:
-        #     raise HTTPException(status_code=400, detail="Maximum 50 emails allowed per batch")
-        
-        # Get fresh token
-        token = await get_fresh_token()
-        
-        extractor = LinkedInProfileExtractor(token)
-        results = []
-        errors = []
-        
-        for i, email in enumerate(emails):
-            try:
-                print(f"Processing {i + 1}/{len(emails)}: {email}")
-                
-                profile_data = await extractor.fetch_linkedin_profile(email)
-                
-                results.append({
-                    "email": email,
-                    "success": True,
-                    "data": profile_data,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                # Add delay between requests (except for the last one)
-                if i < len(emails) - 1:
-                    await asyncio.sleep(delay_seconds)
-                
-                # Longer delay every 10 profiles
-                if (i + 1) % 10 == 0 and i + 1 < len(emails):
-                    print(f"Taking 10 second break after {i + 1} profiles...")
-                    await asyncio.sleep(10)
-                    
-            except Exception as e:
-                error_msg = str(e)
-                print(f"Error processing {email}: {error_msg}")
-                
-                errors.append({
-                    "email": email,
-                    "error": error_msg,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                # Stop on error
-                print("Stopping batch process due to error")
-                break
-        
-        return {
-            "success": True,
-            "total_emails": len(emails),
-            "processed": len(results),
-            "errors": len(errors),
-            "results": results,
-            "errors_details": errors,
-            "completed_at": datetime.now().isoformat()
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Batch processing error: {str(e)}")
-
-@app.post("/profiles/batch/enhanced")
-async def get_linkedin_profiles_batch_enhanced(request: dict):
     """Enhanced batch processing with JavaScript-style logic and progress tracking"""
     try:
         # Extract configuration from request
@@ -368,6 +340,7 @@ async def get_linkedin_profiles_batch_enhanced(request: dict):
         delay_seconds = request.get("delay_seconds", 2)
         stop_on_error = request.get("stop_on_error", True)
         save_individual_files = request.get("save_individual_files", False)
+        save_to_dynamodb = request.get("save_to_dynamodb", True)  # DynamoDB option
         long_break_interval = request.get("long_break_interval", 10)  # Every N profiles
         long_break_duration = request.get("long_break_duration", 10)  # Seconds
         
@@ -378,7 +351,23 @@ async def get_linkedin_profiles_batch_enhanced(request: dict):
             raise HTTPException(status_code=400, detail="Maximum 100 emails allowed per enhanced batch")
         
         print(f"🚀 Starting enhanced batch processing for {len(emails)} emails")
-        print(f"⚙️  Config: delay={delay_seconds}s, stop_on_error={stop_on_error}, long_break_every={long_break_interval}")
+        print(f"⚙️  Config: delay={delay_seconds}s, stop_on_error={stop_on_error}, save_to_dynamodb={save_to_dynamodb}, long_break_every={long_break_interval}")
+        
+        # Initialize DynamoDB if requested
+        dynamodb_manager = None
+        if save_to_dynamodb:
+            try:
+                await ensure_dynamodb_initialized()
+                dynamodb_manager = get_dynamodb_manager()
+                if not dynamodb_manager:
+                    print("⚠️  DynamoDB not available, will skip saving to database")
+                    save_to_dynamodb = False
+                else:
+                    print("✅ DynamoDB ready for saving profiles")
+            except Exception as e:
+                print(f"⚠️  DynamoDB initialization failed: {e}")
+                print("   Will continue without saving to database")
+                save_to_dynamodb = False
         
         # Get fresh token with automatic refresh
         token = await get_fresh_token()
@@ -420,10 +409,24 @@ async def get_linkedin_profiles_batch_enhanced(request: dict):
                     "success": True,
                     "data": profile_data,
                     "timestamp": datetime.now().isoformat(),
-                    "processed_index": i + 1
                 }
                 
                 results.append(result)
+                
+                # Save to DynamoDB if requested
+                if save_to_dynamodb and dynamodb_manager:
+                    try:
+                        save_success = dynamodb_manager.save_profile(result)
+                        if save_success:
+                            result["saved_to_dynamodb"] = True
+                            print(f"💾 Saved to DynamoDB: {email}")
+                        else:
+                            result["saved_to_dynamodb"] = False
+                            print(f"⚠️  Failed to save to DynamoDB: {email}")
+                    except Exception as db_error:
+                        result["saved_to_dynamodb"] = False
+                        result["dynamodb_error"] = str(db_error)
+                        print(f"❌ DynamoDB save error for {email}: {db_error}")
                 
                 # Save individual file if requested
                 if save_individual_files:
@@ -495,6 +498,7 @@ async def get_linkedin_profiles_batch_enhanced(request: dict):
                 "delay_seconds": delay_seconds,
                 "stop_on_error": stop_on_error,
                 "save_individual_files": save_individual_files,
+                "save_to_dynamodb": save_to_dynamodb,
                 "long_break_interval": long_break_interval,
                 "long_break_duration": long_break_duration
             },
@@ -541,7 +545,6 @@ async def download_linkedin_profile(request: dict):
             "email": email,
             "data": profile_data,
             "timestamp": datetime.now().isoformat(),
-            "extracted_by": "LinkedIn Profile Extractor API"
         }
         
         # Create temporary file
@@ -560,93 +563,6 @@ async def download_linkedin_profile(request: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error downloading profile: {str(e)}")
 
-@app.post("/profiles/batch/download")
-async def download_linkedin_profiles_batch(request: dict):
-    """Download LinkedIn profiles for multiple emails as JSON file"""
-    try:
-        # Extract emails and delay from request body
-        emails = request.get("emails", [])
-        delay_seconds = request.get("delay_seconds", 2)
-        
-        if not emails:
-            raise HTTPException(status_code=400, detail="emails array is required in request body")
-        
-        if len(emails) > 50:
-            raise HTTPException(status_code=400, detail="Maximum 50 emails allowed per batch")
-        
-        # Get batch results by calling the internal logic directly
-        # Get fresh token
-        token = await get_fresh_token()
-        
-        extractor = LinkedInProfileExtractor(token)
-        results = []
-        errors = []
-        
-        for i, email in enumerate(emails):
-            try:
-                print(f"Processing {i + 1}/{len(emails)}: {email}")
-                
-                profile_data = await extractor.fetch_linkedin_profile(email)
-                
-                results.append({
-                    "email": email,
-                    "success": True,
-                    "data": profile_data,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                # Add delay between requests (except for the last one)
-                if i < len(emails) - 1:
-                    await asyncio.sleep(delay_seconds)
-                
-                # Longer delay every 10 profiles
-                if (i + 1) % 10 == 0 and i + 1 < len(emails):
-                    print(f"Taking 10 second break after {i + 1} profiles...")
-                    await asyncio.sleep(10)
-                    
-            except Exception as e:
-                error_msg = str(e)
-                print(f"Error processing {email}: {error_msg}")
-                
-                errors.append({
-                    "email": email,
-                    "error": error_msg,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                # Stop on error
-                print("Stopping batch process due to error")
-                break
-        
-        batch_result = {
-            "success": True,
-            "total_emails": len(emails),
-            "processed": len(results),
-            "errors": len(errors),
-            "results": results,
-            "errors_details": errors,
-            "completed_at": datetime.now().isoformat()
-        }
-        
-        # Create filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"linkedin_profiles_batch_{timestamp}.json"
-        
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(batch_result, f, indent=2)
-            temp_path = f.name
-        
-        return FileResponse(
-            path=temp_path,
-            filename=filename,
-            media_type='application/json'
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error downloading batch profiles: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
