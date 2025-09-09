@@ -105,9 +105,51 @@ class DynamoDBManager:
                 print(f"❌ Error checking table existence: {e}")
                 return False
     
+    def _delete_existing_profiles(self, email: str) -> int:
+        """
+        Delete all existing profiles for a given email
+        
+        Args:
+            email: Email address to delete profiles for
+            
+        Returns:
+            int: Number of profiles deleted
+        """
+        try:
+            # Query all items with this email
+            response = self.table.query(
+                KeyConditionExpression=boto3.dynamodb.conditions.Key('email').eq(email)
+            )
+            
+            items = response.get('Items', [])
+            deleted_count = 0
+            
+            # Delete each item
+            for item in items:
+                try:
+                    self.table.delete_item(
+                        Key={
+                            'email': item['email'],
+                            'timestamp': item['timestamp']
+                        }
+                    )
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"⚠️  Failed to delete item for {email} at {item.get('timestamp')}: {e}")
+            
+            if deleted_count > 0:
+                print(f"🗑️  Deleted {deleted_count} existing profile(s) for {email}")
+            
+            return deleted_count
+            
+        except Exception as e:
+            print(f"❌ Failed to delete existing profiles for {email}: {str(e)}")
+            return 0
+    
     def save_profile(self, profile_data: Dict[str, Any]) -> bool:
         """
         Save a single LinkedIn profile to DynamoDB
+        First deletes any existing profiles for the same email, then saves the new one
         
         Args:
             profile_data: Profile data dictionary containing email, data, timestamp, etc.
@@ -120,6 +162,9 @@ class DynamoDBManager:
             if not email:
                 print("❌ No email found in profile data")
                 return False
+            
+            # First, delete any existing profiles for this email
+            self._delete_existing_profiles(email)
             
             # Prepare item for DynamoDB
             item = {
@@ -140,7 +185,7 @@ class DynamoDBManager:
             
             # Save to DynamoDB
             self.table.put_item(Item=item)
-            print(f"✅ Saved profile for {email} to DynamoDB")
+            print(f"✅ Saved profile for {email} to DynamoDB (replaced any existing)")
             return True
             
         except Exception as e:
@@ -150,6 +195,7 @@ class DynamoDBManager:
     def save_batch_profiles(self, profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Save multiple LinkedIn profiles to DynamoDB using batch write
+        First deletes any existing profiles for each email, then saves the new ones
         
         Args:
             profiles: List of profile data dictionaries
@@ -163,8 +209,20 @@ class DynamoDBManager:
         success_count = 0
         error_count = 0
         errors = []
+        deleted_count = 0
         
         try:
+            # First, collect all unique emails and delete existing profiles
+            unique_emails = set()
+            for profile in profiles:
+                email = profile.get('email')
+                if email:
+                    unique_emails.add(email)
+            
+            # Delete existing profiles for all emails
+            for email in unique_emails:
+                deleted_count += self._delete_existing_profiles(email)
+            
             # Use batch_writer for efficient batch operations
             with self.table.batch_writer() as batch:
                 for profile in profiles:
@@ -204,7 +262,7 @@ class DynamoDBManager:
                         })
                         print(f"❌ Error preparing profile for batch save: {str(e)}")
             
-            print(f"✅ Batch save completed: {success_count} successful, {error_count} errors")
+            print(f"✅ Batch save completed: {success_count} successful, {error_count} errors, {deleted_count} existing profiles deleted")
             
         except Exception as e:
             print(f"❌ Batch save failed: {str(e)}")
@@ -214,6 +272,7 @@ class DynamoDBManager:
         return {
             "success_count": success_count,
             "error_count": error_count,
+            "deleted_count": deleted_count,
             "errors": errors,
             "total_profiles": len(profiles)
         }

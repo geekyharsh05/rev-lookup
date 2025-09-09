@@ -377,6 +377,12 @@ async def get_linkedin_profiles_batch(request: dict):
         results = []
         errors = []
         start_time = datetime.now()
+        dynamodb_stats = {
+            "profiles_saved": 0,
+            "profiles_replaced": 0,
+            "profiles_failed": 0,
+            "total_deleted": 0
+        }
         
         # Process each email
         for i, email in enumerate(emails):
@@ -419,13 +425,20 @@ async def get_linkedin_profiles_batch(request: dict):
                         save_success = dynamodb_manager.save_profile(result)
                         if save_success:
                             result["saved_to_dynamodb"] = True
-                            print(f"💾 Saved to DynamoDB: {email}")
+                            result["dynamodb_action"] = "saved_and_replaced"
+                            dynamodb_stats["profiles_saved"] += 1
+                            dynamodb_stats["profiles_replaced"] += 1
+                            print(f"💾 Saved to DynamoDB (replaced existing): {email}")
                         else:
                             result["saved_to_dynamodb"] = False
+                            result["dynamodb_action"] = "failed"
+                            dynamodb_stats["profiles_failed"] += 1
                             print(f"⚠️  Failed to save to DynamoDB: {email}")
                     except Exception as db_error:
                         result["saved_to_dynamodb"] = False
+                        result["dynamodb_action"] = "error"
                         result["dynamodb_error"] = str(db_error)
+                        dynamodb_stats["profiles_failed"] += 1
                         print(f"❌ DynamoDB save error for {email}: {db_error}")
                 
                 # Save individual file if requested
@@ -502,6 +515,7 @@ async def get_linkedin_profiles_batch(request: dict):
                 "long_break_interval": long_break_interval,
                 "long_break_duration": long_break_duration
             },
+            "dynamodb_stats": dynamodb_stats if save_to_dynamodb else None,
             "results": results,
             "errors": errors
         }
@@ -511,6 +525,8 @@ async def get_linkedin_profiles_batch(request: dict):
         print(f"   • Successfully processed: {len(results)}")
         print(f"   • Errors: {len(errors)}")
         print(f"   • Success rate: {summary['success_rate']}%")
+        if save_to_dynamodb and dynamodb_stats:
+            print(f"   • DynamoDB: {dynamodb_stats['profiles_saved']} saved/replaced, {dynamodb_stats['profiles_failed']} failed")
         print(f"   • Total duration: {summary['processing_duration_human']}")
         print(f"   • Average per email: {summary['average_time_per_email']}s")
         
