@@ -15,7 +15,6 @@ from dynamodb_manager import get_dynamodb_manager, initialize_dynamodb_manager
 import tempfile
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
 app = FastAPI(

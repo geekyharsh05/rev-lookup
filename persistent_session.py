@@ -38,21 +38,27 @@ class PersistentOutlookSession:
         self.profile_path = os.path.join(os.getcwd(), "chrome_profile")
         
     def initialize_browser(self):
-        """Initialize Chrome browser with persistent profile"""
+        """Initialize Chrome browser with persistent profile and performance logging"""
         try:
-            print("� Initializing Chrome browser...")
+            print("🌐 Initializing Chrome browser...")
             
             options = webdriver.ChromeOptions()
             options.add_argument(f"--user-data-dir={self.profile_path}")
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
-            # Remove headless for better debugging
-            # options.add_argument("--headless")
             options.add_argument("--disable-blink-features=AutomationControlled")
+            
+            # Enable performance logging for token capture
+            options.add_argument("--enable-logging")
+            options.add_argument("--log-level=0")
+            options.add_argument("--enable-network-service-logging")
+            options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
             
             print(f"🔧 Using profile path: {self.profile_path}")
+            print("📊 Performance logging enabled for token capture")
             
             # Initialize the driver with a longer timeout
             try:
@@ -243,6 +249,16 @@ class PersistentOutlookSession:
             
             self.is_logged_in = True
             print("✅ Successfully logged into Outlook!")
+            
+            # Extract initial token immediately
+            print("🔑 Attempting initial token extraction...")
+            initial_token = self.extract_bearer_token()
+            
+            if initial_token:
+                print("✅ Initial token extracted successfully!")
+            else:
+                print("⚠️  No token found immediately after login - will continue monitoring")
+            
             return True
             
         except Exception as e:
@@ -252,128 +268,372 @@ class PersistentOutlookSession:
             return False
     
     def extract_bearer_token(self):
-        """Extract Bearer token from current session"""
+        """Extract Bearer token from current session with loki.delve monitoring"""
         if not self.browser or not self.is_logged_in:
             print("❌ No active session to extract token from")
             return None
         
-        print("🔍 Extracting Bearer token...")
+        print("🔍 Extracting Bearer token with loki.delve monitoring...")
         
         try:
-            # Method 1: Try browser storage first
+            # Method 1: Check if token.txt already has a valid token
             try:
-                script = """
-                var token = localStorage.getItem('authToken') || 
-                           localStorage.getItem('AccessToken') || 
-                           localStorage.getItem('msal.token') ||
-                           sessionStorage.getItem('authToken') ||
-                           sessionStorage.getItem('AccessToken');
+                token_file = os.path.join(os.getcwd(), "token.txt")
+                if os.path.exists(token_file):
+                    with open(token_file, 'r') as f:
+                        existing_token = f.read().strip()
+                    
+                    if existing_token and len(existing_token) > 100:
+                        print("💾 Found existing token in token.txt")
+                        print(f"   Token: {existing_token[:50]}...")
+                        self.last_token = existing_token
+                        self.token_timestamp = datetime.now()
+                        return existing_token
+            except Exception:
+                pass
+            
+            # Method 2: Check performance logs for loki.delve requests first
+            try:
+                print("📊 Monitoring performance logs for loki.delve requests...")
+                logs = self.browser.get_log('performance')
                 
-                if (token && !token.startsWith('Bearer')) {
-                    token = 'Bearer ' + token;
+                for entry in logs[-50:]:  # Check last 50 entries
+                    try:
+                        log_message = json.loads(entry['message'])
+                        message = log_message.get('message', {})
+                        
+                        if message.get('method') == 'Network.requestWillBeSent':
+                            params = message.get('params', {})
+                            request = params.get('request', {})
+                            url = request.get('url', '')
+                            
+                            if 'loki.delve.office.com' in url:
+                                headers = request.get('headers', {})
+                                auth_header = headers.get('Authorization') or headers.get('authorization')
+                                
+                                if auth_header and auth_header.startswith('Bearer'):
+                                    print(f"✅ Found Bearer token in loki.delve request!")
+                                    print(f"   URL: {url[:100]}...")
+                                    print(f"   Token: {auth_header[:50]}...")
+                                    self.last_token = auth_header
+                                    self.token_timestamp = datetime.now()
+                                    self._save_token_to_file(auth_header)
+                                    return auth_header
+                                    
+                    except Exception:
+                        continue
+                        
+            except Exception as perf_error:
+                print(f"Performance logs check failed: {perf_error}")
+            
+            # Method 3: Check browser storage for authentication tokens
+            try:
+                print("🔄 Trying browser storage extraction...")
+                script = """
+                const keys = ['authToken', 'AccessToken', 'msal.token', 'bearerToken', 'ms-token'];
+                for (let storage of [localStorage, sessionStorage]) {
+                    for (let key of keys) {
+                        const value = storage.getItem(key);
+                        if (value && (value.includes('eyJ') || value.startsWith('Bearer'))) {
+                            return value.startsWith('Bearer') ? value : 'Bearer ' + value;
+                        }
+                    }
+                    
+                    // Check all keys for token-like values
+                    for (let i = 0; i < storage.length; i++) {
+                        const key = storage.key(i);
+                        const value = storage.getItem(key);
+                        if (key && key.toLowerCase().includes('token') && value && value.length > 500) {
+                            if (value.includes('eyJ') || value.startsWith('Bearer')) {
+                                return value.startsWith('Bearer') ? value : 'Bearer ' + value;
+                            }
+                        }
+                    }
                 }
-                return token;
+                return null;
                 """
                 
                 stored_token = self.browser.execute_script(script)
                 if stored_token and stored_token != 'null':
                     self.last_token = stored_token
                     self.token_timestamp = datetime.now()
+                    self._save_token_to_file(stored_token)
                     print(f"✅ Token extracted from storage: {stored_token[:50]}...")
                     return stored_token
             except Exception as e:
                 print(f"Storage extraction failed: {e}")
             
-            # Method 2: Make a test request to LinkedIn to trigger network activity
+            # Method 4: Navigate to LinkedIn-enabled features in Outlook
             try:
-                print("🔄 Making test request to capture fresh token...")
-                self.browser.execute_script("""
-                fetch('https://www.linkedin.com/voyager/api/me', {
-                    method: 'GET',
-                    headers: {
-                        'Accept': 'application/json',
-                        'csrf-token': 'ajax:1234567890'
-                    },
-                    credentials: 'include'
-                }).catch(() => {});
-                """)
+                print("🔄 Navigating to LinkedIn-enabled features in Outlook...")
                 
-                time.sleep(2)
+                # Navigate to People/Contacts section which often has LinkedIn integration
+                people_urls = [
+                    'https://outlook.live.com/people/',
+                    'https://outlook.live.com/contacts/',
+                    'https://outlook.live.com/mail/0/search'
+                ]
                 
-                # Check for performance logs if available
-                try:
-                    logs = self.browser.get_log('performance')
-                    for log in logs:
+                for url in people_urls:
+                    try:
+                        print(f"   Navigating to: {url}")
+                        self.browser.get(url)
+                        time.sleep(5)
+                        
+                        # Clear performance logs to get fresh requests
                         try:
-                            message = json.loads(log['message'])
-                            if message['message']['method'] == 'Network.requestWillBeSent':
-                                headers = message['message']['params'].get('request', {}).get('headers', {})
-                                auth_header = headers.get('Authorization') or headers.get('authorization')
-                                if auth_header and auth_header.startswith('Bearer'):
-                                    self.last_token = auth_header
-                                    self.token_timestamp = datetime.now()
-                                    print(f"✅ Fresh token captured: {auth_header[:50]}...")
-                                    return auth_header
+                            self.browser.get_log('performance')  # Clear existing logs
                         except:
-                            continue
-                except Exception as perf_error:
-                    print(f"Performance logs not available: {perf_error}")
-                    
+                            pass
+                        
+                        # Try to trigger LinkedIn-related activity without complex JavaScript
+                        simple_trigger_script = """
+                        // Simple triggers that are less likely to fail
+                        const searchInputs = document.querySelectorAll('input[type="search"], input[placeholder*="Search"]');
+                        if (searchInputs.length > 0) {
+                            const input = searchInputs[0];
+                            if (input.offsetParent !== null) { // Check if visible
+                                input.focus();
+                                input.value = 'john.doe@example.com';
+                                input.dispatchEvent(new Event('input', { bubbles: true }));
+                                return 'search-triggered';
+                            }
+                        }
+                        
+                        const buttons = document.querySelectorAll('button');
+                        for (let btn of buttons) {
+                            const text = btn.textContent.toLowerCase();
+                            if ((text.includes('new') || text.includes('contact') || text.includes('person')) && btn.offsetParent !== null) {
+                                btn.click();
+                                return 'button-clicked';
+                            }
+                        }
+                        
+                        return 'no-elements';
+                        """
+                        
+                        trigger_result = self.browser.execute_script(simple_trigger_script)
+                        print(f"   Trigger result: {trigger_result}")
+                        
+                        if trigger_result in ['search-triggered', 'button-clicked']:
+                            time.sleep(3)
+                            
+                            # Check performance logs again after triggering
+                            try:
+                                logs = self.browser.get_log('performance')
+                                print(f"   Found {len(logs)} new log entries after trigger")
+                                
+                                for entry in logs:
+                                    try:
+                                        log_message = json.loads(entry['message'])
+                                        message = log_message.get('message', {})
+                                        
+                                        if message.get('method') == 'Network.requestWillBeSent':
+                                            params = message.get('params', {})
+                                            request = params.get('request', {})
+                                            url = request.get('url', '')
+                                            
+                                            if 'loki.delve.office.com' in url:
+                                                headers = request.get('headers', {})
+                                                auth_header = headers.get('Authorization') or headers.get('authorization')
+                                                
+                                                if auth_header and auth_header.startswith('Bearer'):
+                                                    print(f"✅ Found Bearer token after triggering LinkedIn features!")
+                                                    print(f"   URL: {url[:100]}...")
+                                                    print(f"   Token: {auth_header[:50]}...")
+                                                    self.last_token = auth_header
+                                                    self.token_timestamp = datetime.now()
+                                                    self._save_token_to_file(auth_header)
+                                                    return auth_header
+                                                    
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                pass
+                        
+                    except Exception as nav_error:
+                        print(f"   Navigation failed: {nav_error}")
+                        continue
+                
             except Exception as e:
-                print(f"Test request failed: {e}")
+                print(f"Navigation-based extraction failed: {e}")
             
-            # Method 3: Stay in Outlook and try different extraction approaches
+            # Method 5: Check for authentication in browser context
             try:
-                print("🔄 Trying additional Outlook-based token extraction...")
+                print("🔄 Checking browser's authentication context...")
                 
-                # Make sure we're on Outlook
-                if 'outlook' not in self.browser.current_url.lower():
-                    self.browser.get('https://outlook.live.com/mail/0/')
-                    time.sleep(3)
-                
-                # Try to find tokens in global variables or page context
-                outlook_script = """
-                // Look for Outlook-specific token storage
-                const outlookTokens = [];
-                
-                // Check for OWA (Outlook Web App) global variables
-                if (window.OWA && window.OWA.bootstrap && window.OWA.bootstrap.globals) {
-                    const globals = window.OWA.bootstrap.globals;
-                    if (globals.authToken) outlookTokens.push('Bearer ' + globals.authToken);
-                    if (globals.accessToken) outlookTokens.push('Bearer ' + globals.accessToken);
+                # Check for authentication cookies and headers
+                auth_context_script = """
+                // Check cookies for authentication tokens
+                const cookies = document.cookie.split(';');
+                for (let cookie of cookies) {
+                    const [name, value] = cookie.split('=');
+                    if (name && (name.includes('authtoken') || name.includes('access_token') || name.includes('Bearer'))) {
+                        if (value && (value.includes('Bearer') || value.includes('eyJ'))) {
+                            return value.startsWith('Bearer') ? value : 'Bearer ' + value;
+                        }
+                    }
                 }
                 
-                // Check for Microsoft-specific storage keys
-                const msKeys = ['msal.token', 'authToken', 'AccessToken', 'ms-token'];
-                msKeys.forEach(key => {
-                    const localVal = localStorage.getItem(key);
-                    const sessionVal = sessionStorage.getItem(key);
-                    if (localVal && (localVal.includes('eyJ') || localVal.startsWith('Bearer'))) {
-                        outlookTokens.push(localVal.startsWith('Bearer') ? localVal : 'Bearer ' + localVal);
+                // Check window objects for authentication
+                const authVars = ['authToken', 'accessToken', 'bearerToken', 'token'];
+                for (let varName of authVars) {
+                    if (window[varName] && typeof window[varName] === 'string' && window[varName].length > 100) {
+                        return window[varName].startsWith('Bearer') ? window[varName] : 'Bearer ' + window[varName];
                     }
-                    if (sessionVal && (sessionVal.includes('eyJ') || sessionVal.startsWith('Bearer'))) {
-                        outlookTokens.push(sessionVal.startsWith('Bearer') ? sessionVal : 'Bearer ' + sessionVal);
-                    }
-                });
+                }
                 
-                return outlookTokens.length > 0 ? outlookTokens[0] : null;
+                // Check for Microsoft Graph/Office context
+                if (window.Microsoft && window.Microsoft.Graph && window.Microsoft.Graph.token) {
+                    return 'Bearer ' + window.Microsoft.Graph.token;
+                }
+                
+                return null;
                 """
                 
-                outlook_token = self.browser.execute_script(outlook_script)
-                if outlook_token:
-                    print("✅ Found Outlook token in page context!")
-                    return outlook_token
+                auth_token = self.browser.execute_script(auth_context_script)
+                if auth_token and auth_token != 'null':
+                    print("✅ Found authentication token in browser context!")
+                    self.last_token = auth_token
+                    self.token_timestamp = datetime.now()
+                    self._save_token_to_file(auth_token)
+                    return auth_token
                 
             except Exception as e:
-                print(f"Outlook token extraction failed: {e}")
+                print(f"Browser context extraction failed: {e}")
             
-            print("⚠️  Could not extract fresh token - performance logs not available in this Chrome version")
-            print("ℹ️  For Bearer token extraction, need to navigate to LinkedIn and be logged in there")
+            print("❌ Could not extract Bearer token from any source")
+            print("💡 Try these manual steps:")
+            print("   1. Navigate to People/Contacts in Outlook")
+            print("   2. Search for a contact or create a new one")
+            print("   3. This should trigger LinkedIn profile requests")
+            print("   4. Run the token extraction again")
+            
             return self.last_token
             
         except Exception as e:
             print(f"❌ Token extraction error: {e}")
             return self.last_token
+    
+    def _save_token_to_file(self, token):
+        """Save token to token.txt file"""
+        try:
+            token_file = os.path.join(os.getcwd(), "token.txt")
+            with open(token_file, 'w') as f:
+                f.write(token)
+            os.chmod(token_file, 0o600)
+            print(f"💾 Token saved to token.txt")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to save token: {e}")
+            return False
+
+    def extract_bearer_token_enhanced(self):
+        """Enhanced Bearer token extraction from current session with loki.delve monitoring"""
+        if not self.browser or not self.is_logged_in:
+            print("❌ No active session to extract token from")
+            return None
+        
+        print("🔍 Extracting Bearer token with enhanced loki.delve monitoring...")
+        
+        try:
+            # Method 1: Check performance logs for loki.delve requests
+            try:
+                print("📊 Monitoring performance logs for loki.delve requests...")
+                logs = self.browser.get_log('performance')
+                
+                for entry in logs[-50:]:  # Check last 50 entries
+                    try:
+                        log_message = json.loads(entry['message'])
+                        message = log_message.get('message', {})
+                        
+                        if message.get('method') == 'Network.requestWillBeSent':
+                            params = message.get('params', {})
+                            request = params.get('request', {})
+                            url = request.get('url', '')
+                            
+                            if 'loki.delve.office.com' in url:
+                                headers = request.get('headers', {})
+                                auth_header = headers.get('Authorization') or headers.get('authorization')
+                                
+                                if auth_header and auth_header.startswith('Bearer'):
+                                    print(f"✅ Found Bearer token in loki.delve request!")
+                                    self.last_token = auth_header
+                                    self.token_timestamp = datetime.now()
+                                    self._save_token_to_file(auth_header)
+                                    return auth_header
+                                    
+                    except Exception:
+                        continue
+                        
+            except Exception as perf_error:
+                print(f"Performance logs check failed: {perf_error}")
+            
+            # Method 2: Trigger a loki.delve request to capture token
+            try:
+                print("🔄 Triggering loki.delve request to capture fresh token...")
+                
+                capture_script = """
+                return new Promise((resolve) => {
+                    let capturedToken = null;
+                    
+                    const originalFetch = window.fetch;
+                    window.fetch = function(url, options) {
+                        if (url.includes('loki.delve.office.com') && options && options.headers) {
+                            const authHeader = options.headers.authorization || options.headers.Authorization;
+                            if (authHeader && authHeader.startsWith('Bearer')) {
+                                capturedToken = authHeader;
+                            }
+                        }
+                        return originalFetch.apply(this, arguments);
+                    };
+                    
+                    // Test request to capture token
+                    const testEmail = 'test@example.com';
+                    const encodedEmail = testEmail.replace('@', '%40');
+                    const correlationId = Math.random().toString(36).substring(2, 15);
+                    
+                    const testUrl = `https://nam.loki.delve.office.com/api/v2/linkedin/profiles?smtp=${encodedEmail}&personaType=User&displayName=${encodedEmail}&RootCorrelationId=${correlationId}&CorrelationId=${correlationId}&ClientCorrelationId=${correlationId}&ConvertGetPost=true`;
+                    
+                    fetch(testUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json',
+                            'X-ClientType': 'OneOutlook',
+                            'X-ClientFeature': 'LivePersonaCard'
+                        },
+                        body: JSON.stringify({})
+                    }).finally(() => {
+                        window.fetch = originalFetch;
+                        resolve(capturedToken);
+                    });
+                    
+                    setTimeout(() => {
+                        window.fetch = originalFetch;
+                        resolve(capturedToken);
+                    }, 8000);
+                });
+                """
+                
+                fresh_token = self.browser.execute_async_script(capture_script)
+                if fresh_token:
+                    print(f"✅ Captured fresh Bearer token!")
+                    self.last_token = fresh_token
+                    self.token_timestamp = datetime.now()
+                    self._save_token_to_file(fresh_token)
+                    return fresh_token
+                    
+            except Exception as script_error:
+                print(f"Script capture failed: {script_error}")
+            
+            # Method 3: Fallback to original method
+            print("🔄 Falling back to original extraction method...")
+            return self.extract_bearer_token()
+            
+        except Exception as e:
+            print(f"❌ Enhanced token extraction error: {e}")
+            return self.extract_bearer_token()
     
     def refresh_session(self):
         """Refresh the session to keep it alive"""
@@ -397,9 +657,66 @@ class PersistentOutlookSession:
             print(f"❌ Session refresh failed: {e}")
             return False
     
+    def monitor_loki_requests(self):
+        """Continuously monitor for loki.delve requests and extract tokens"""
+        print("🔍 Starting loki.delve request monitoring...")
+        
+        while self.keep_alive and self.browser and self.is_logged_in:
+            try:
+                # Check performance logs every 10 seconds
+                time.sleep(10)
+                
+                try:
+                    logs = self.browser.get_log('performance')
+                    
+                    for entry in logs[-10:]:  # Check last 10 entries
+                        try:
+                            log_message = json.loads(entry['message'])
+                            message = log_message.get('message', {})
+                            
+                            if message.get('method') == 'Network.requestWillBeSent':
+                                params = message.get('params', {})
+                                request = params.get('request', {})
+                                url = request.get('url', '')
+                                
+                                if 'loki.delve.office.com' in url:
+                                    headers = request.get('headers', {})
+                                    auth_header = headers.get('Authorization') or headers.get('authorization')
+                                    
+                                    if auth_header and auth_header.startswith('Bearer'):
+                                        print(f"\n🎉 NEW TOKEN CAPTURED from loki.delve!")
+                                        print(f"   URL: {url[:100]}...")
+                                        print(f"   Token: {auth_header[:50]}...")
+                                        self.last_token = auth_header
+                                        self.token_timestamp = datetime.now()
+                                        self._save_token_to_file(auth_header)
+                                        
+                        except Exception:
+                            continue
+                            
+                except Exception as perf_error:
+                    # Performance logs might not be available, continue monitoring
+                    pass
+                
+                # Print monitoring status
+                token_age = ""
+                if self.token_timestamp:
+                    age = datetime.now() - self.token_timestamp
+                    token_age = f" | Last token: {age.total_seconds():.0f}s ago"
+                
+                print(f"🔍 Monitoring loki.delve requests...{token_age}", end='\r')
+                
+            except Exception as e:
+                print(f"\n❌ Monitor error: {e}")
+                time.sleep(5)
+    
     def keep_session_alive(self):
-        """Keep the session alive in a background thread"""
-        print("🔄 Starting session keep-alive thread...")
+        """Keep the session alive in a background thread with token monitoring"""
+        print("🔄 Starting session keep-alive and token monitoring...")
+        
+        # Start loki monitoring in a separate thread
+        monitor_thread = threading.Thread(target=self.monitor_loki_requests, daemon=True)
+        monitor_thread.start()
         
         while self.keep_alive and self.browser:
             try:
@@ -409,6 +726,15 @@ class PersistentOutlookSession:
                         if not self.login_to_outlook():
                             print("❌ Re-login failed")
                             break
+                    
+                    # Check for fresh tokens every 5 minutes
+                    if self.token_timestamp:
+                        age = datetime.now() - self.token_timestamp
+                        if age.total_seconds() > 300:  # 5 minutes
+                            print("\n🔄 Token is old, extracting fresh token...")
+                            fresh_token = self.extract_bearer_token()
+                            if fresh_token:
+                                print("✅ Fresh token extracted!")
                 
                 # Sleep for 30 seconds before next check
                 time.sleep(30)
@@ -420,7 +746,7 @@ class PersistentOutlookSession:
                     age = datetime.now() - self.token_timestamp
                     token_age = f" | Token age: {age.total_seconds():.0f}s"
                 
-                print(f"📊 Session Status: {status}{token_age}", end='\r')
+                print(f"\n📊 Session Status: {status}{token_age}")
                 
             except Exception as e:
                 print(f"\n❌ Keep-alive error: {e}")

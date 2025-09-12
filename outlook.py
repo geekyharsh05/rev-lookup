@@ -9,13 +9,15 @@ import time
 import os
 import json
 import re
+import traceback
 
 options = ChromeOptions()
 
 # Enable logging to capture network requests
 options.add_argument("--enable-logging")
 options.add_argument("--log-level=0")
-options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+options.add_argument("--enable-network-service-logging")
+options.set_capability('goog:loggingPrefs', {'performance': 'ALL', 'browser': 'ALL'})
 
 # OUTLOOK_EMAIL="harshisbest1@outlook.com"
 # OUTLOOK_PASSWORD="I9jcdbma9k@"
@@ -204,133 +206,231 @@ def find_next_button():
     return None
 
 
-def extract_bearer_token():
-    """Extract Bearer token from browser session"""
+def save_token_to_file(token):
+    """Save Bearer token to token.txt file"""
     try:
-        print("Extracting Bearer token...")
+        token_file = os.path.join(os.getcwd(), "token.txt")
+        with open(token_file, 'w') as f:
+            f.write(token)
+        os.chmod(token_file, 0o600)  # Secure file permissions
+        print(f"💾 Token saved to token.txt: {token[:50]}...")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to save token to file: {e}")
+        return False
+
+
+def extract_bearer_token():
+    """Extract Bearer token from browser session using performance logs"""
+    try:
+        print("🔍 Extracting Bearer token from network requests...")
         
-        # Method 1: Check localStorage
-        try:
-            local_storage = browser.execute_script("return localStorage;")
-            for key, value in local_storage.items():
-                if 'token' in key.lower() or 'auth' in key.lower():
-                    if isinstance(value, str) and ('Bearer' in value or 'eyJ' in value):
-                        print(f"Found token in localStorage['{key}']")
-                        return value if value.startswith('Bearer') else f'Bearer {value}'
-        except Exception as e:
-            print(f"localStorage check failed: {e}")
-        
-        # Method 2: Check sessionStorage
-        try:
-            session_storage = browser.execute_script("return sessionStorage;")
-            for key, value in session_storage.items():
-                if 'token' in key.lower() or 'auth' in key.lower():
-                    if isinstance(value, str) and ('Bearer' in value or 'eyJ' in value):
-                        print(f"Found token in sessionStorage['{key}']")
-                        return value if value.startswith('Bearer') else f'Bearer {value}'
-        except Exception as e:
-            print(f"sessionStorage check failed: {e}")
-        
-        # Method 3: Intercept network requests
-        try:
-            print("Navigating to Outlook to capture network requests...")
+        # First, trigger some activity by navigating to Outlook
+        if 'outlook' not in browser.current_url.lower():
+            print("📧 Navigating to Outlook to trigger network activity...")
             browser.get('https://outlook.live.com/mail/0/')
             time.sleep(5)
-            
-            # Get browser logs
-            logs = browser.get_log('performance')
-            for log in logs:
-                message = json.loads(log['message'])
-                if message['message']['method'] == 'Network.requestWillBeSent':
-                    headers = message['message']['params'].get('request', {}).get('headers', {})
-                    auth_header = headers.get('Authorization') or headers.get('authorization')
-                    if auth_header and auth_header.startswith('Bearer'):
-                        print("Found Bearer token in network request")
-                        return auth_header
-        except Exception as e:
-            print(f"Network interception failed: {e}")
         
-        # Method 4: Execute script to make a test API call and capture token
+        # Method 1: Extract from performance logs - looking for loki.delve requests
         try:
-            print("Attempting to capture token from API call...")
-            script = """
-            // Try to find and return any Bearer token from the page context
-            const authToken = window.localStorage.getItem('authToken') || 
-                             window.localStorage.getItem('AccessToken') ||
-                             window.localStorage.getItem('msal.token') ||
-                             window.sessionStorage.getItem('authToken') ||
-                             window.sessionStorage.getItem('AccessToken');
+            print("📊 Checking performance logs for loki.delve requests...")
+            logs = browser.get_log('performance')
             
-            if (authToken) {
-                return authToken.startsWith('Bearer') ? authToken : 'Bearer ' + authToken;
+            for entry in logs:
+                try:
+                    log_message = json.loads(entry['message'])
+                    message = log_message.get('message', {})
+                    
+                    # Look for Network.requestWillBeSent events
+                    if message.get('method') == 'Network.requestWillBeSent':
+                        params = message.get('params', {})
+                        request = params.get('request', {})
+                        url = request.get('url', '')
+                        
+                        # Check if this is a loki.delve request
+                        if 'loki.delve.office.com' in url:
+                            headers = request.get('headers', {})
+                            auth_header = headers.get('Authorization') or headers.get('authorization')
+                            
+                            if auth_header and auth_header.startswith('Bearer'):
+                                print(f"✅ Found Bearer token in loki.delve request!")
+                                print(f"   URL: {url[:100]}...")
+                                print(f"   Token: {auth_header[:50]}...")
+                                
+                                # Save token to file immediately
+                                save_token_to_file(auth_header)
+                                return auth_header
+                                
+                except Exception as log_error:
+                    continue  # Skip malformed log entries
+                    
+        except Exception as perf_error:
+            print(f"⚠️  Performance logs not available: {perf_error}")
+        
+        # Method 2: Force trigger a loki.delve request to capture the token
+        try:
+            print("🔄 Triggering loki.delve request to capture token...")
+            
+            # First check for existing auth state
+            auth_check_script = """
+            // Check for authentication tokens in browser context
+            const localStorageKeys = Object.keys(localStorage);
+            const sessionStorageKeys = Object.keys(sessionStorage);
+            
+            for (let key of localStorageKeys.concat(sessionStorageKeys)) {
+                if (key.includes('msal') || key.includes('access_token') || key.includes('authToken')) {
+                    const storage = localStorage.getItem(key) || sessionStorage.getItem(key);
+                    if (storage && (storage.includes('Bearer') || storage.includes('eyJ'))) {
+                        return storage.startsWith('Bearer') ? storage : 'Bearer ' + storage;
+                    }
+                }
             }
-            
-            // Try to extract from any global variables
-            if (window.OWA && window.OWA.config && window.OWA.config.authToken) {
-                return 'Bearer ' + window.OWA.config.authToken;
-            }
-            
             return null;
             """
             
-            token = browser.execute_script(script)
-            if token:
-                print("Found token from page context")
-                return token
-                
-        except Exception as e:
-            print(f"Script execution failed: {e}")
-        
-        # Method 5: Make a test request to capture the token
-        try:
-            print("Making test request to capture authorization header...")
-            script = """
-            return new Promise((resolve) => {
-                const originalFetch = window.fetch;
+            auth_token = browser.execute_script(auth_check_script)
+            if auth_token and auth_token != 'null':
+                print(f"✅ Found authentication token in browser context!")
+                print(f"   Token: {auth_token[:50]}...")
+                save_token_to_file(auth_token)
+                return auth_token
+            
+            # Improved script with better error handling
+            capture_script = """
+            return new Promise((resolve, reject) => {
                 let capturedToken = null;
+                let timeoutId = null;
                 
-                window.fetch = function(...args) {
-                    const [url, options] = args;
-                    if (options && options.headers && options.headers.authorization) {
-                        capturedToken = options.headers.authorization;
-                    }
-                    return originalFetch.apply(this, args);
-                };
-                
-                // Make a test request
-                fetch('/api/v1/me', {
-                    headers: {
-                        'Accept': 'application/json'
-                    }
-                }).then(() => {
-                    window.fetch = originalFetch;
-                    resolve(capturedToken);
-                }).catch(() => {
-                    window.fetch = originalFetch;
-                    resolve(capturedToken);
-                });
-                
-                // Timeout fallback
-                setTimeout(() => {
-                    window.fetch = originalFetch;
-                    resolve(capturedToken);
-                }, 5000);
+                try {
+                    const originalFetch = window.fetch;
+                    
+                    window.fetch = function(url, options) {
+                        try {
+                            if (url && url.includes && url.includes('loki.delve.office.com')) {
+                                if (options && options.headers) {
+                                    const authHeader = options.headers.authorization || options.headers.Authorization;
+                                    if (authHeader && authHeader.startsWith('Bearer')) {
+                                        capturedToken = authHeader;
+                                    }
+                                }
+                            }
+                            return originalFetch.apply(this, arguments);
+                        } catch (e) {
+                            return originalFetch.apply(this, arguments);
+                        }
+                    };
+                    
+                    // Set timeout for cleanup
+                    timeoutId = setTimeout(() => {
+                        try {
+                            window.fetch = originalFetch;
+                            resolve(capturedToken);
+                        } catch (e) {
+                            resolve(null);
+                        }
+                    }, 5000);
+                    
+                    // Try to trigger LinkedIn-related activity
+                    setTimeout(() => {
+                        try {
+                            // Look for search elements that might trigger LinkedIn lookups
+                            const searchBoxes = document.querySelectorAll('input[type="search"], input[placeholder*="search"]');
+                            if (searchBoxes.length > 0) {
+                                const searchBox = searchBoxes[0];
+                                searchBox.focus();
+                                searchBox.value = 'test@example.com';
+                                searchBox.dispatchEvent(new Event('input', { bubbles: true }));
+                            }
+                        } catch (interactionError) {
+                            console.log('Interaction failed:', interactionError);
+                        }
+                    }, 1000);
+                    
+                } catch (mainError) {
+                    resolve(null);
+                }
             });
             """
             
-            token = browser.execute_async_script(script)
+            token = browser.execute_async_script(capture_script)
             if token:
-                print("Captured token from intercepted request")
+                print(f"✅ Captured Bearer token from interaction!")
+                print(f"   Token: {token[:50]}...")
+                save_token_to_file(token)
                 return token
                 
-        except Exception as e:
-            print(f"Request interception failed: {e}")
+        except Exception as script_error:
+            print(f"⚠️  Script capture method failed: {script_error}")
         
-        print("❌ Could not extract Bearer token")
+        # Method 3: Navigate to LinkedIn-enabled features
+        try:
+            print("🔄 Navigating to LinkedIn-enabled features...")
+            
+            # Try the People section
+            browser.get('https://outlook.live.com/people/')
+            time.sleep(5)
+            
+            # Check performance logs after navigation
+            logs = browser.get_log('performance')
+            for entry in logs[-10:]:  # Check last 10 entries
+                try:
+                    log_message = json.loads(entry['message'])
+                    message = log_message.get('message', {})
+                    
+                    if message.get('method') == 'Network.requestWillBeSent':
+                        params = message.get('params', {})
+                        request = params.get('request', {})
+                        url = request.get('url', '')
+                        
+                        if 'loki.delve.office.com' in url:
+                            headers = request.get('headers', {})
+                            auth_header = headers.get('Authorization') or headers.get('authorization')
+                            
+                            if auth_header and auth_header.startswith('Bearer'):
+                                print(f"✅ Found Bearer token after navigation!")
+                                print(f"   URL: {url[:100]}...")
+                                print(f"   Token: {auth_header[:50]}...")
+                                save_token_to_file(auth_header)
+                                return auth_header
+                                
+                except Exception:
+                    continue
+                    
+        except Exception as nav_error:
+            print(f"⚠️  Navigation method failed: {nav_error}")
+        
+        # Method 3: Fallback to existing storage methods
+        print("🔄 Falling back to storage-based extraction...")
+        
+        # Check localStorage and sessionStorage
+        try:
+            storage_script = """
+            const keys = ['authToken', 'AccessToken', 'msal.token', 'bearerToken'];
+            for (let storage of [localStorage, sessionStorage]) {
+                for (let key of keys) {
+                    const value = storage.getItem(key);
+                    if (value && (value.includes('eyJ') || value.startsWith('Bearer'))) {
+                        return value.startsWith('Bearer') ? value : 'Bearer ' + value;
+                    }
+                }
+            }
+            return null;
+            """
+            
+            storage_token = browser.execute_script(storage_script)
+            if storage_token:
+                print(f"✅ Found token in browser storage!")
+                save_token_to_file(storage_token)
+                return storage_token
+                
+        except Exception as storage_error:
+            print(f"⚠️  Storage extraction failed: {storage_error}")
+        
+        print("❌ Could not extract Bearer token from any source")
         return None
         
     except Exception as e:
-        print(f"Error extracting Bearer token: {e}")
+        print(f"❌ Error extracting Bearer token: {e}")
         return None
 
 
@@ -655,35 +755,89 @@ def login():
             print("No stay signed in dialog found or already handled")
 
         # Navigate to inbox
-        print("Navigating to inbox...")
+        print("📧 Navigating to inbox...")
         browser.get(r'https://outlook.live.com/mail/0/')
+        
+        # Wait for inbox to load and capture token
+        print("⏳ Waiting for inbox to load and capturing token...")
+        time.sleep(10)
+        
+        # Extract Bearer token with enhanced method
+        token = extract_bearer_token()
+        
+        if token:
+            print("✅ Successfully extracted and saved Bearer token!")
+            print(f"Token preview: {token[:50]}...")
+        else:
+            print("❌ Failed to extract Bearer token")
+        
         print("Login completed successfully!")
-
-        # Keep the session alive for 30 minutes
+        
+        # Keep the session alive for token monitoring
         try:
             keep_alive_minutes = 30
             end_time = time.time() + keep_alive_minutes * 60
-            print(f"Keeping session alive for {keep_alive_minutes} minutes...")
+            print(f"🔄 Monitoring session for {keep_alive_minutes} minutes for additional token captures...")
+            
+            # Periodically check for new tokens
+            last_check = time.time()
             while time.time() < end_time:
                 try:
                     browser.execute_script("void(0);")
+                    
+                    # Check for new tokens every 5 minutes
+                    if time.time() - last_check > 300:  # 5 minutes
+                        print("🔍 Checking for fresh token...")
+                        fresh_token = extract_bearer_token()
+                        if fresh_token:
+                            print("🔄 Updated token captured!")
+                        last_check = time.time()
+                        
                 except Exception:
                     pass
+                    
                 remaining = int(end_time - time.time())
                 mins, secs = divmod(remaining, 60)
-                print(f"Session alive - {mins:02d}:{secs:02d} remaining", end='\r')
+                print(f"Session monitoring - {mins:02d}:{secs:02d} remaining", end='\r')
                 time.sleep(30)
-            print("\n30-minute session window elapsed.")
+                
+            print("\n30-minute monitoring session completed.")
         except KeyboardInterrupt:
-            print("\nSession keep-alive interrupted by user.")
+            print("\nSession monitoring interrupted by user.")
         
     except Exception as e:
-        print(f"Error during login: {str(e)}")
+        print(f"❌ Error during login: {str(e)}")
+        traceback.print_exc()
         # Keep browser open for debugging
         input("Press Enter to close browser...")
     finally:
-        pass
+        try:
+            browser.quit()
+            print("✅ Browser closed")
+        except:
+            pass
 
 
 if __name__ == '__main__':
-    login()
+    print("🚀 Outlook Login with Bearer Token Extraction")
+    print("=" * 50)
+    print("This tool will:")
+    print("📧 Log into Outlook")
+    print("🔍 Monitor network requests for loki.delve.office.com")
+    print("🔑 Extract and save Bearer tokens to token.txt")
+    print("💾 Automatically save tokens when found")
+    print("=" * 50)
+    
+    try:
+        login()
+    except KeyboardInterrupt:
+        print("\n👋 Process interrupted by user")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        traceback.print_exc()
+    finally:
+        try:
+            browser.quit()
+        except:
+            pass
+        print("Program ended.")
