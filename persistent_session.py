@@ -41,7 +41,7 @@ class PersistentOutlookSession:
         """Initialize Chrome browser with persistent profile and performance logging"""
         try:
             print("🌐 Initializing Chrome browser...")
-            
+  
             options = webdriver.ChromeOptions()
             options.add_argument(f"--user-data-dir={self.profile_path}")
             options.add_argument("--no-sandbox")

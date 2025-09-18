@@ -39,10 +39,23 @@ dynamodb_initialized: bool = False
 
 class LinkedInProfileExtractor:
     def __init__(self, auth_token: str):
-        self.auth_token = auth_token
+        # Sanitize auth token to prevent header injection
+        self.auth_token = self._sanitize_header_value(auth_token)
+        
+    def _sanitize_header_value(self, value: str) -> str:
+        """Remove newlines and carriage returns that could cause header injection"""
+        if not value:
+            return value
+        # Remove \r, \n, and other control characters that could break HTTP headers
+        sanitized = value.replace('\r', '').replace('\n', '').replace('\r\n', '')
+        # Also remove other potential problematic characters
+        sanitized = ''.join(char for char in sanitized if ord(char) >= 32 or char in ['\t'])
+        return sanitized.strip()
         
     def encode_email(self, email: str) -> str:
-        return email.replace('@', '%40')
+        # Sanitize email before encoding to prevent injection
+        clean_email = self._sanitize_header_value(email)
+        return clean_email.replace('@', '%40')
     
     def generate_correlation_id(self) -> str:
         return str(uuid.uuid4())
@@ -77,9 +90,28 @@ class LinkedInProfileExtractor:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json={}) as response:
                 if response.status != 200:
+                    error_text = await response.text()
+                    
+                    # Handle specific error cases
+                    if response.status == 403:
+                        # Check if it's a user restriction error
+                        if "User is restricted" in error_text:
+                            raise HTTPException(
+                                status_code=403,
+                                detail=f"LinkedIn profile access restricted for {email}. User account may have privacy settings or restrictions."
+                            )
+                    elif response.status == 424:
+                        # Failed dependency - usually means upstream service issue
+                        if "User is restricted" in error_text:
+                            raise HTTPException(
+                                status_code=424,
+                                detail=f"LinkedIn profile access denied for {email}. User may be restricted or have privacy settings enabled."
+                            )
+                    
+                    # Generic error handling
                     raise HTTPException(
                         status_code=response.status,
-                        detail=f"LinkedIn API error: {response.status} - {await response.text()}"
+                        detail=f"LinkedIn API error: {response.status} - {error_text}"
                     )
                 
                 return await response.json()
@@ -346,9 +378,6 @@ async def get_linkedin_profiles_batch(request: dict):
         if not emails:
             raise HTTPException(status_code=400, detail="emails array is required in request body")
         
-        if len(emails) > 100:
-            raise HTTPException(status_code=400, detail="Maximum 100 emails allowed per enhanced batch")
-        
         print(f"🚀 Starting enhanced batch processing for {len(emails)} emails")
         print(f"⚙️  Config: delay={delay_seconds}s, stop_on_error={stop_on_error}, save_to_dynamodb={save_to_dynamodb}, long_break_every={long_break_interval}")
         
@@ -579,26 +608,63 @@ async def download_linkedin_profile(request: dict):
         raise HTTPException(status_code=500, detail=f"Error downloading profile: {str(e)}")
 
 
+# Add enhanced batch processing endpoints
+try:
+    from enhanced_batch_api import add_enhanced_batch_endpoints, initialize_batch_system
+    add_enhanced_batch_endpoints(app)
+    print("✅ Enhanced batch processing endpoints added")
+except ImportError as e:
+    print(f"⚠️  Enhanced batch processing not available: {e}")
+
 @app.on_event("startup")
 async def startup_event():
-    """Start the persistent session on startup"""
+    """Start the persistent session and batch processing system on startup"""
     print("🚀 API Server starting up...")
+    
+    # Start existing session
     try:
         await ensure_session_started()
         print("✅ Persistent session initialized")
     except Exception as e:
-        print(f"⚠️  Could not start persistent session on startup: {e}")
+        print(f"Could not start persistent session on startup: {e}")
         print("   Session will be started on first request")
+    
+    # Initialize batch processing system
+    try:
+        from enhanced_batch_api import initialize_batch_system
+        from heartbeat_polling_service import start_heartbeat_service
+        
+        # Initialize components
+        initialize_batch_system()
+        
+        # Start heartbeat service
+        start_heartbeat_service()
+        
+        print("✅ Enhanced batch processing system started")
+    except Exception as e:
+        print(f"⚠️  Could not start batch processing system: {e}")
+        print("   Batch processing features may not be available")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
+    print("🛑 API Server shutting down...")
+    
+    # Stop batch processing system
+    try:
+        from heartbeat_polling_service import stop_heartbeat_service
+        stop_heartbeat_service()
+        print("✅ Batch processing system stopped")
+    except Exception as e:
+        print(f"⚠️  Error stopping batch processing system: {e}")
+    
+    # Stop persistent session
     try:
         from persistent_session import stop_persistent_session
         stop_persistent_session()
         print("✅ Persistent session stopped")
     except Exception as e:
-        print(f"⚠️  Error stopping session: {e}")
+        print(f"❌ Error stopping session: {e}")
 
 if __name__ == "__main__":
     import uvicorn
