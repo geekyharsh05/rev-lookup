@@ -71,13 +71,13 @@ class ProfileDatabaseManager:
                         TableName=self.table_name,
                         KeySchema=[
                             {
-                                'AttributeName': 'id',
+                                'AttributeName': 'url',
                                 'KeyType': 'HASH'  # Partition key
                             }
                         ],
                         AttributeDefinitions=[
                             {
-                                'AttributeName': 'id',
+                                'AttributeName': 'url',
                                 'AttributeType': 'S'  # String
                             }
                         ],
@@ -108,14 +108,14 @@ class ProfileDatabaseManager:
             bool: True if saved successfully, False otherwise
         """
         try:
-            profile_id = mapped_profile.get('id', {}).get('S', '')
-            if not profile_id:
-                print("❌ No profile ID found in mapped profile data")
+            profile_url = mapped_profile.get('url', {}).get('S', '')
+            if not profile_url:
+                print("❌ No profile URL found in mapped profile data")
                 return False
             
             # Save to DynamoDB
             self.table.put_item(Item=mapped_profile)
-            print(f"✅ Saved mapped profile to profile_database: {profile_id}")
+            print(f"✅ Saved mapped profile to profile_database: {profile_url}")
             return True
             
         except Exception as e:
@@ -144,10 +144,10 @@ class ProfileDatabaseManager:
             with self.table.batch_writer() as batch:
                 for mapped_profile in mapped_profiles:
                     try:
-                        profile_id = mapped_profile.get('id', {}).get('S', '')
-                        if not profile_id:
+                        profile_url = mapped_profile.get('url', {}).get('S', '')
+                        if not profile_url:
                             error_count += 1
-                            errors.append({"profile": mapped_profile, "error": "No profile ID found"})
+                            errors.append({"profile": mapped_profile, "error": "No profile URL found"})
                             continue
                         
                         # Add to batch
@@ -176,19 +176,19 @@ class ProfileDatabaseManager:
             "total_profiles": len(mapped_profiles)
         }
     
-    def get_profile(self, profile_id: str) -> Optional[Dict[str, Any]]:
+    def get_profile(self, profile_url: str) -> Optional[Dict[str, Any]]:
         """
         Get a profile from profile_database table
         
         Args:
-            profile_id: Profile ID to look up
+            profile_url: Profile URL (LinkedIn ID) to look up
             
         Returns:
             Profile data if found, None otherwise
         """
         try:
             response = self.table.get_item(
-                Key={'id': profile_id}
+                Key={'url': profile_url}
             )
             
             if 'Item' in response:
@@ -197,8 +197,69 @@ class ProfileDatabaseManager:
                 return None
                 
         except Exception as e:
-            print(f"❌ Failed to get profile for {profile_id}: {str(e)}")
+            print(f"❌ Failed to get profile for {profile_url}: {str(e)}")
             return None
+    
+    def list_profiles_paginated(self, limit: int = 10, start_key: str = None) -> tuple:
+        """List profiles with pagination"""
+        try:
+            scan_kwargs = {
+                'Limit': limit,
+                'ProjectionExpression': 'url, #name, position, linkedin_id, #timestamp, current_company_name, avatar',
+                'ExpressionAttributeNames': {
+                    '#name': 'name',
+                    '#timestamp': 'timestamp'
+                }
+            }
+            
+            if start_key:
+                scan_kwargs['ExclusiveStartKey'] = {'url': start_key}
+            
+            response = self.table.scan(**scan_kwargs)
+            
+            items = response.get('Items', [])
+            next_key = response.get('LastEvaluatedKey', {}).get('url') if 'LastEvaluatedKey' in response else None
+            
+            return items, next_key
+        except Exception as e:
+            print(f"❌ Error listing profiles: {e}")
+            return [], None
+
+    def scan_profiles_by_attributes(self, attributes: Dict) -> List[Dict]:
+        """Scan profiles by attributes (expensive operation, use carefully)"""
+        try:
+            filter_expressions = []
+            expression_values = {}
+            expression_names = {}
+            
+            for key, value in attributes.items():
+                if value:  # Only add non-empty values
+                    if key == 'name':
+                        filter_expressions.append("contains(#name, :name_val)")
+                        expression_names['#name'] = 'name'
+                        expression_values[':name_val'] = value
+                    elif key == 'current_company_name':
+                        filter_expressions.append("contains(current_company_name, :company_val)")
+                        expression_values[':company_val'] = value
+            
+            if not filter_expressions:
+                return []
+            
+            scan_kwargs = {
+                'FilterExpression': ' AND '.join(filter_expressions),
+                'ExpressionAttributeValues': expression_values,
+                'Limit': 20  # Limit scan results
+            }
+            
+            if expression_names:
+                scan_kwargs['ExpressionAttributeNames'] = expression_names
+            
+            response = self.table.scan(**scan_kwargs)
+            return response.get('Items', [])
+            
+        except Exception as e:
+            print(f"❌ Error scanning profiles: {e}")
+            return []
 
 # Global instance
 _profile_database_manager = None
@@ -242,3 +303,4 @@ def initialize_profile_database_manager(aws_access_key_id: str = None,
     except Exception as e:
         print(f"❌ Failed to initialize Profile Database manager: {str(e)}")
         raise e
+

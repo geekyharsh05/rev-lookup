@@ -323,7 +323,7 @@ async def root():
         "database_tables": {
             "bearer_token": "Primary token storage with automatic expiry and usage tracking",
             "linkedin_profiles": "Original API responses (email + timestamp as keys)",
-            "profile_database": "Formatted profiles with mapped structure (id as key)"
+            "profile_database": "Formatted profiles with mapped structure (url as key)"
         }
     }
 
@@ -634,16 +634,24 @@ async def get_linkedin_profiles_batch(request: dict):
                         if profile_database_manager:
                             try:
                                 mapped_profile = LinkedInProfileMapper.map_profile_data(result, email)
-                                profile_save_success = profile_database_manager.save_profile(mapped_profile)
                                 
-                                if profile_save_success:
-                                    result["saved_to_profile_database"] = True
-                                    profile_database_stats["profiles_saved"] += 1
-                                    print(f"🗃️  Saved mapped profile to profile_database table: {email}")
+                                # Check if mapping was successful (non-None result)
+                                if mapped_profile is not None:
+                                    profile_save_success = profile_database_manager.save_profile(mapped_profile)
+                                    
+                                    if profile_save_success:
+                                        result["saved_to_profile_database"] = True
+                                        profile_database_stats["profiles_saved"] += 1
+                                        print(f"🗃️  Saved mapped profile to profile_database table: {email}")
+                                    else:
+                                        result["saved_to_profile_database"] = False
+                                        profile_database_stats["profiles_failed"] += 1
+                                        print(f"⚠️  Failed to save mapped profile to profile_database table: {email}")
                                 else:
+                                    # Mapping returned None - profile cannot be saved (no LinkedIn ID)
                                     result["saved_to_profile_database"] = False
-                                    profile_database_stats["profiles_failed"] += 1
-                                    print(f"⚠️  Failed to save mapped profile to profile_database table: {email}")
+                                    result["profile_database_skip_reason"] = "No LinkedIn ID found - profile_database requires LinkedIn ID as partition key"
+                                    print(f"⚠️  Skipped profile_database save for {email}: No LinkedIn ID found")
                                     
                             except Exception as mapping_error:
                                 result["saved_to_profile_database"] = False
@@ -834,6 +842,13 @@ async def get_mapped_linkedin_profile(request: dict):
         # Map the profile data to profile_database structure
         mapped_profile = LinkedInProfileMapper.map_profile_data(result, email)
         
+        # Check if mapping was successful
+        if mapped_profile is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Cannot map profile for {email}: No LinkedIn ID found. Profile database requires LinkedIn ID as partition key."
+            )
+        
         response = {
             "success": True,
             "email": email,
@@ -897,6 +912,13 @@ async def map_from_linkedin_profiles_table(request: dict):
         # Map the data using your existing structure
         mapped_profile = LinkedInProfileMapper.map_profile_data(profile_record, email)
         
+        # Check if mapping was successful
+        if mapped_profile is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Cannot map profile for {email}: No LinkedIn ID found. Profile database requires LinkedIn ID as partition key."
+            )
+        
         # Save to profile_database table
         save_to_profile_db = request.get("save_to_profile_db", True)
         saved = False
@@ -956,17 +978,26 @@ async def batch_map_from_linkedin_profiles(request: dict):
                     # Map the data
                     mapped_profile = LinkedInProfileMapper.map_profile_data(profile_record, email)
                     
-                    # Save to profile_database table
-                    saved = profile_database_manager.save_profile(mapped_profile)
-                    
-                    results.append({
-                        "email": email,
-                        "success": True,
-                        "mapped": True,
-                        "saved_to_profile_database": saved
-                    })
-                    
-                    print(f"✅ Mapped and saved profile for {email}")
+                    # Check if mapping was successful
+                    if mapped_profile is not None:
+                        # Save to profile_database table
+                        saved = profile_database_manager.save_profile(mapped_profile)
+                        
+                        results.append({
+                            "email": email,
+                            "success": True,
+                            "mapped": True,
+                            "saved_to_profile_database": saved
+                        })
+                        
+                        print(f"✅ Mapped and saved profile for {email}")
+                    else:
+                        # Mapping failed - no LinkedIn ID
+                        errors.append({
+                            "email": email,
+                            "error": "No LinkedIn ID found - profile_database requires LinkedIn ID as partition key"
+                        })
+                        print(f"⚠️  Skipped profile for {email}: No LinkedIn ID found")
                 else:
                     errors.append({
                         "email": email,

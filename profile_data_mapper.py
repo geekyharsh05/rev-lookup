@@ -52,11 +52,15 @@ class LinkedInProfileMapper:
             linkedin_url = profile.get('linkedInUrl', '')
             linkedin_id = LinkedInProfileMapper._extract_linkedin_id(linkedin_url)
             
+            # Use ONLY LinkedIn ID as partition key - if no LinkedIn ID, skip this profile
+            if not linkedin_id:
+                print(f"⚠️  No LinkedIn ID found for {email}, cannot save to profile_database (LinkedIn ID required)")
+                return LinkedInProfileMapper._create_empty_profile_structure(email, "No LinkedIn ID found - profile_database requires LinkedIn ID as partition key")
+            
             # Build the mapped profile
             mapped_profile = {
-                "id": {"S": linkedin_id or email.replace('@', '_at_').replace('.', '_')},
-                "url": {"S": linkedin_id or ""},
-                "linkedin_id": {"S": linkedin_id or ""},
+                "url": {"S": linkedin_id},
+                "linkedin_id": {"S": linkedin_id},
                 "linkedin_num_id": {"S": LinkedInProfileMapper._extract_numeric_id_from_urn(profile.get('id', ''))},
                 "input": {
                     "M": {
@@ -468,8 +472,14 @@ class LinkedInProfileMapper:
     @staticmethod
     def _create_empty_profile_structure(email: str, error_msg: str = "") -> Dict:
         """Create empty profile structure with error information"""
+        # If this is an error about missing LinkedIn ID, return None to indicate
+        # this profile should not be saved to profile_database table
+        if "No LinkedIn ID found" in error_msg:
+            return None
+        
+        # For other errors, create empty structure (should not reach here anymore)
         return {
-            "id": {"S": email.replace('@', '_at_').replace('.', '_')},
+            "id": {"S": ""},  # No ID without LinkedIn ID
             "url": {"S": ""},
             "linkedin_id": {"S": ""},
             "linkedin_num_id": {"S": ""},
