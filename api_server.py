@@ -14,6 +14,7 @@ from token_manager import get_token_manager, get_valid_token
 from dynamodb_manager import get_dynamodb_manager, initialize_dynamodb_manager
 from profile_database_manager import get_profile_database_manager, initialize_profile_database_manager
 from profile_data_mapper import LinkedInProfileMapper
+from dynamo_token_manager import get_dynamo_token_manager
 import tempfile
 from dotenv import load_dotenv
 
@@ -210,11 +211,29 @@ async def ensure_profile_database_initialized():
     return True
 
 async def get_fresh_token() -> str:
-    """Get a fresh Bearer token - simple logic: use token.txt if exists, extract if not"""
+    """Get a fresh Bearer token - prioritize DynamoDB bearer_token table over token.txt"""
     try:
         print("📄 Getting token for API request...")
         
-        # Step 1: Check if token.txt exists and has content
+        # Step 1: Try to get token from DynamoDB bearer_token table first
+        try:
+            dynamo_token_manager = get_dynamo_token_manager()
+            if dynamo_token_manager:
+                print("🔍 Checking DynamoDB bearer_token table...")
+                token_result = dynamo_token_manager.get_available_token()
+                
+                if token_result:
+                    token, token_id = token_result
+                    print(f"✅ Using token from DynamoDB bearer_token table (ID: {token_id}): {token[:50]}...")
+                    return token
+                else:
+                    print("⚠️  No available tokens found in DynamoDB bearer_token table")
+            else:
+                print("⚠️  DynamoDB token manager not available")
+        except Exception as e:
+            print(f"⚠️  Failed to get token from DynamoDB: {e}")
+        
+        # Step 2: Fallback to token.txt if no DynamoDB tokens available
         token_file = os.path.join(os.getcwd(), "token.txt")
         
         if os.path.exists(token_file):
@@ -223,7 +242,7 @@ async def get_fresh_token() -> str:
                     token = f.read().strip()
                 
                 if token:
-                    print(f"✅ Using token from token.txt: {token[:50]}...")
+                    print(f"🔄 Fallback: Using token from token.txt: {token[:50]}...")
                     return token
                 else:
                     print("⚠️  token.txt exists but is empty")
@@ -232,28 +251,44 @@ async def get_fresh_token() -> str:
         else:
             print("ℹ️  token.txt file does not exist")
         
-        # Step 2: No token in file, try to extract from existing session
+        # Step 3: No token in DynamoDB or file, try to extract from existing session
         session_manager = get_session_manager()
         if session_manager and session_manager.browser and session_manager.is_logged_in:
-            print("🔄 No token file, trying to extract from existing browser session...")
+            print("🔄 No tokens available, trying to extract from existing browser session...")
             try:
                 fresh_token = session_manager.extract_bearer_token()
                 if fresh_token:
-                    # Save to token.txt for future use
-                    with open(token_file, 'w') as f:
-                        f.write(fresh_token)
-                    os.chmod(token_file, 0o600)
-                    print(f"✅ Extracted and saved token to token.txt: {fresh_token[:50]}...")
+                    # Try to save to DynamoDB first, fallback to token.txt
+                    try:
+                        dynamo_token_manager = get_dynamo_token_manager()
+                        if dynamo_token_manager:
+                            success = dynamo_token_manager.add_token(fresh_token)
+                            if success:
+                                print(f"✅ Extracted token saved to DynamoDB bearer_token table: {fresh_token[:50]}...")
+                            else:
+                                print("⚠️  Failed to save extracted token to DynamoDB, saving to token.txt...")
+                                with open(token_file, 'w') as f:
+                                    f.write(fresh_token)
+                                os.chmod(token_file, 0o600)
+                        else:
+                            # Save to token.txt as fallback
+                            with open(token_file, 'w') as f:
+                                f.write(fresh_token)
+                            os.chmod(token_file, 0o600)
+                            print(f"✅ Extracted token saved to token.txt: {fresh_token[:50]}...")
+                    except Exception as save_error:
+                        print(f"⚠️  Error saving extracted token: {save_error}")
+                    
                     return fresh_token
             except Exception as e:
                 print(f"⚠️  Failed to extract from existing session: {e}")
         
-        # Step 3: No token and no session - clear instructions
-        print("❌ No token.txt file and no active browser session")
+        # Step 4: No token available anywhere
+        print("❌ No Bearer tokens found in DynamoDB bearer_token table, token.txt file, or active browser session")
         
         raise HTTPException(
             status_code=401, 
-            detail="No Bearer token found. Please create token.txt file or extract a fresh token."
+            detail="No Bearer token found. Please add tokens to DynamoDB bearer_token table, create token.txt file, or extract a fresh token."
         )
         
     except HTTPException:
@@ -266,7 +301,13 @@ async def get_fresh_token() -> str:
 async def root():
     return {
         "message": "LinkedIn Profile Extractor API",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "token_system": {
+            "primary_storage": "DynamoDB bearer_token table",
+            "fallback_storage": "token.txt file",
+            "priority_order": "DynamoDB > token.txt > browser extraction",
+            "note": "System now prioritizes DynamoDB bearer_token table over token.txt"
+        },
         "endpoints": {
             "POST /profile": "Get LinkedIn profile for single email (body: {email: 'user@example.com'})",
             "POST /profiles/batch": "Enhanced batch processing with automatic profile_database mapping (body: {emails: [...], delay_seconds: 2, stop_on_error: true, save_individual_files: false, save_to_dynamodb: true, long_break_interval: 10, long_break_duration: 10})",
@@ -275,11 +316,12 @@ async def root():
             "POST /profiles/batch-map-from-linkedin": "Batch map profiles from linkedin_profiles to profile_database (body: {emails: [...]})",
             "POST /profile/download": "Download single LinkedIn profile as JSON file (body: {email: 'user@example.com'})",
             "GET /health": "Health check",
-            "GET /token/status": "Check token status",
+            "GET /token/status": "Check token status from both DynamoDB and token.txt",
             "POST /token/refresh": "Force token refresh (may open browser)",
-            "POST /token/manual": "Manually upload Bearer token (body: {token: 'Bearer xyz...'})"
+            "POST /token/manual": "Manually upload Bearer token to both DynamoDB and token.txt (body: {token: 'Bearer xyz...'})"
         },
         "database_tables": {
+            "bearer_token": "Primary token storage with automatic expiry and usage tracking",
             "linkedin_profiles": "Original API responses (email + timestamp as keys)",
             "profile_database": "Formatted profiles with mapped structure (id as key)"
         }
@@ -300,8 +342,8 @@ async def health_check():
 
 @app.get("/token/status")
 async def token_status():
-    """Enhanced token status with automatic refresh monitoring"""
-    # Get status from both session manager and token manager
+    """Enhanced token status with DynamoDB and file-based token information"""
+    # Get status from session manager
     session_manager = get_session_manager()
     token_manager = get_token_manager()
     
@@ -311,12 +353,47 @@ async def token_status():
         "session_token_timestamp": session_manager.token_timestamp.isoformat() if session_manager and session_manager.token_timestamp else None,
     }
     
-    token_status = token_manager.get_token_status()
+    # Get DynamoDB token status
+    dynamodb_status = {}
+    try:
+        dynamo_token_manager = get_dynamo_token_manager()
+        if dynamo_token_manager:
+            dynamodb_status = dynamo_token_manager.get_status()
+            dynamodb_status["source"] = "DynamoDB bearer_token table"
+        else:
+            dynamodb_status = {
+                "source": "DynamoDB bearer_token table",
+                "available": False,
+                "error": "DynamoDB token manager not available"
+            }
+    except Exception as e:
+        dynamodb_status = {
+            "source": "DynamoDB bearer_token table", 
+            "available": False,
+            "error": str(e)
+        }
+    
+    # Get file-based token status
+    file_token_status = {}
+    try:
+        token_status_data = token_manager.get_token_status()
+        file_token_status = {
+            **token_status_data,
+            "source": "token.txt file"
+        }
+    except Exception as e:
+        file_token_status = {
+            "source": "token.txt file",
+            "available": False,
+            "error": str(e)
+        }
     
     return {
         **session_status,
-        **token_status,
-        "auto_refresh_active": token_manager.auto_refresh_thread.is_alive() if token_manager.auto_refresh_thread else False
+        "dynamodb_tokens": dynamodb_status,
+        "file_token": file_token_status,
+        "token_priority": "DynamoDB bearer_token table > token.txt file > browser session extraction",
+        "auto_refresh_active": token_manager.auto_refresh_thread.is_alive() if token_manager and token_manager.auto_refresh_thread else False
     }
 
 @app.post("/token/refresh")
@@ -341,7 +418,7 @@ async def force_token_refresh():
 
 @app.post("/token/manual")
 async def manual_token_upload(request: dict):
-    """Manually upload a Bearer token"""
+    """Manually upload a Bearer token - saves to both DynamoDB and token.txt"""
     try:
         token = request.get("token", "").strip()
         
@@ -359,20 +436,48 @@ async def manual_token_upload(request: dict):
         # Accept any token that looks like a Bearer token
         print(f"✅ Accepting token for manual upload: {token[:50]}...")
         
-        # Save token
-        token_manager = get_token_manager()
-        if token_manager.save_token_to_file(token):
-            token_manager.current_token = token
-            token_manager.token_expires_at = token_manager.get_token_expiration(token)
+        # Save to DynamoDB first (primary storage)
+        dynamodb_success = False
+        try:
+            dynamo_token_manager = get_dynamo_token_manager()
+            if dynamo_token_manager:
+                dynamodb_success = dynamo_token_manager.add_token(token)
+                if dynamodb_success:
+                    print("✅ Token saved to DynamoDB bearer_token table")
+                else:
+                    print("⚠️  Failed to save token to DynamoDB")
+        except Exception as e:
+            print(f"⚠️  Error saving to DynamoDB: {e}")
+        
+        # Save to token.txt (fallback storage)
+        file_success = False
+        try:
+            token_manager = get_token_manager()
+            if token_manager.save_token_to_file(token):
+                token_manager.current_token = token
+                token_manager.token_expires_at = token_manager.get_token_expiration(token)
+                file_success = True
+                print("✅ Token saved to token.txt file")
+        except Exception as e:
+            print(f"⚠️  Error saving to token.txt: {e}")
+        
+        # Return success if either storage method worked
+        if dynamodb_success or file_success:
+            storage_info = []
+            if dynamodb_success:
+                storage_info.append("DynamoDB bearer_token table")
+            if file_success:
+                storage_info.append("token.txt file")
             
             return {
                 "success": True,
-                "message": "Token uploaded and saved successfully",
+                "message": f"Token uploaded and saved successfully to: {', '.join(storage_info)}",
                 "token_preview": token[:50] + "...",
-                "expires_at": token_manager.token_expires_at.isoformat() if token_manager.token_expires_at else None
+                "saved_to": storage_info,
+                "primary_storage": "DynamoDB bearer_token table" if dynamodb_success else "token.txt file"
             }
         else:
-            raise HTTPException(status_code=500, detail="Failed to save token to file")
+            raise HTTPException(status_code=500, detail="Failed to save token to any storage location")
             
     except HTTPException:
         raise
