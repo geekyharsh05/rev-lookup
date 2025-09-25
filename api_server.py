@@ -150,7 +150,7 @@ async def ensure_dynamodb_initialized():
             # Get credentials from environment variables
             aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
             aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-            aws_region = os.getenv('AWS_REGION', 'us-east-1')
+            aws_region = os.getenv('AWS_REGION', 'ap-south-1')
             table_name = os.getenv('DYNAMODB_TABLE_NAME', 'linkedin_profiles')
             
             if not aws_access_key_id or not aws_secret_access_key:
@@ -185,7 +185,7 @@ async def ensure_profile_database_initialized():
             # Get credentials from environment variables
             aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
             aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-            aws_region = os.getenv('AWS_REGION', 'us-east-1')
+            aws_region = os.getenv('AWS_REGION', 'ap-south-1')
             
             if not aws_access_key_id or not aws_secret_access_key:
                 print("⚠️  AWS credentials not found for Profile Database")

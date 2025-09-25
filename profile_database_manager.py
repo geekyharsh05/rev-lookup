@@ -10,7 +10,7 @@ class ProfileDatabaseManager:
     def __init__(self, 
                  aws_access_key_id: str = None,
                  aws_secret_access_key: str = None,
-                 region_name: str = "us-east-1",
+                 region_name: str = "ap-south-1",
                  table_name: str = "profile_database"):
         """
         Initialize Profile Database manager with credentials and table configuration
@@ -335,7 +335,7 @@ def get_profile_database_manager() -> Optional[ProfileDatabaseManager]:
 
 def initialize_profile_database_manager(aws_access_key_id: str = None,
                                        aws_secret_access_key: str = None,
-                                       region_name: str = "us-east-1",
+                                       region_name: str = "ap-south-1",
                                        table_name: str = "profile_database") -> ProfileDatabaseManager:
     """
     Initialize the global Profile Database manager

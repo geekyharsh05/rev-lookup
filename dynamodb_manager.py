@@ -10,7 +10,7 @@ class DynamoDBManager:
     def __init__(self, 
                  aws_access_key_id: str = None,
                  aws_secret_access_key: str = None,
-                 region_name: str = "us-east-1",
+                 region_name: str = "ap-south-1",
                  table_name: str = "linkedin_profiles"):
         """
         Initialize DynamoDB manager with credentials and table configuration
@@ -323,7 +323,7 @@ def get_dynamodb_manager() -> Optional[DynamoDBManager]:
 
 def initialize_dynamodb_manager(aws_access_key_id: str = None,
                                aws_secret_access_key: str = None,
-                               region_name: str = "us-east-1",
+                               region_name: str = "ap-south-1",
                                table_name: str = "linkedin_profiles") -> DynamoDBManager:
     """
     Initialize the global DynamoDB manager

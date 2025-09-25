@@ -38,7 +38,7 @@ class DynamoTokenManager:
                  token_lifetime_hours: int = 22,
                  aws_access_key_id: str = None,
                  aws_secret_access_key: str = None,
-                 region_name: str = "us-east-1"):
+                 region_name: str = "ap-south-1"):
         
         self.table_name = table_name
         self.max_daily_requests = max_daily_requests
@@ -572,7 +572,7 @@ def get_dynamo_token_manager() -> DynamoTokenManager:
         # Get AWS credentials from environment
         aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
         aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-        aws_region = os.getenv('AWS_REGION', 'us-east-1')
+        aws_region = os.getenv('AWS_REGION', 'ap-south-1')
         
         _dynamo_token_manager = DynamoTokenManager(
             aws_access_key_id=aws_access_key_id,

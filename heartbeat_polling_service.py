@@ -17,6 +17,8 @@ import traceback
 from dynamo_token_manager import get_dynamo_token_manager
 from memory_job_queue import get_memory_job_queue, JobStatus, BatchJob
 from dynamodb_manager import get_dynamodb_manager
+from profile_data_mapper import LinkedInProfileMapper
+from profile_database_manager import ProfileDatabaseManager
 
 @dataclass
 class HeartbeatConfig:
@@ -65,7 +67,7 @@ class EmailProcessor:
                 
                 aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
                 aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-                aws_region = os.getenv('AWS_REGION', 'us-east-1')
+                aws_region = os.getenv('AWS_REGION', 'ap-south-1')
                 table_name = os.getenv('DYNAMODB_TABLE_NAME', 'linkedin_profiles')
                 
                 self.dynamodb_manager = initialize_dynamodb_manager(
@@ -86,6 +88,14 @@ class EmailProcessor:
             print(f"⚠️  DynamoDB manager initialization failed: {e}")
             self.dynamodb_manager = None
             self.save_to_dynamodb = False
+
+        # Initialize ProfileDatabaseManager for profile_database table mapping
+        try:
+            self.profile_database_manager = ProfileDatabaseManager()
+            print("✅ Profile database manager initialized for profile_database table")
+        except Exception as e:
+            print(f"⚠️  Profile database manager initialization failed: {e}")
+            self.profile_database_manager = None
         
         # Processing state
         self.current_email_index = 0
@@ -309,6 +319,34 @@ class EmailProcessor:
                         result["saved_to_linkedin_profiles"] = False
                         result["dynamodb_error"] = str(db_error)
                         print(f"❌ {email}: DynamoDB save error - {db_error}")
+
+                # Map and save to profile_database table (formatted structure)
+                if self.profile_database_manager:
+                    try:
+                        mapped_profile = LinkedInProfileMapper.map_profile_data(result, email)
+                        
+                        # Check if mapping was successful (non-None result)
+                        if mapped_profile is not None:
+                            profile_save_success = self.profile_database_manager.save_profile(mapped_profile)
+                            
+                            if profile_save_success:
+                                result["saved_to_profile_database"] = True
+                                print(f"🗃️  {email}: Saved mapped profile to profile_database table")
+                            else:
+                                result["saved_to_profile_database"] = False
+                                print(f"⚠️  {email}: Failed to save mapped profile to profile_database table")
+                        else:
+                            result["saved_to_profile_database"] = False
+                            result["profile_mapping_error"] = "Failed to map profile data"
+                            print(f"⚠️  {email}: Failed to map profile data for profile_database table")
+                    
+                    except Exception as profile_error:
+                        result["saved_to_profile_database"] = False
+                        result["profile_database_error"] = str(profile_error)
+                        print(f"❌ {email}: Profile database save error - {profile_error}")
+                else:
+                    result["saved_to_profile_database"] = False
+                    result["profile_mapping_error"] = "Profile database manager not available"
                 
                 print(f"✅ {email}: Profile fetched successfully")
                 return True

@@ -73,7 +73,7 @@ def add_enhanced_batch_endpoints(app: FastAPI):
             
             aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
             aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-            aws_region = os.getenv('AWS_REGION', 'us-east-1')
+            aws_region = os.getenv('AWS_REGION', 'ap-south-1')
             table_name = os.getenv('DYNAMODB_TABLE_NAME', 'linkedin_profiles')
             
             linkedin_dynamodb = initialize_dynamodb_manager(
@@ -745,7 +745,7 @@ def initialize_batch_system():
         
         aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
         aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-        aws_region = os.getenv('AWS_REGION', 'us-east-1')
+        aws_region = os.getenv('AWS_REGION', 'ap-south-1')
         table_name = os.getenv('DYNAMODB_TABLE_NAME', 'linkedin_profiles')
         
         linkedin_db = initialize_dynamodb_manager(
