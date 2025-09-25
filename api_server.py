@@ -12,6 +12,8 @@ import threading
 from persistent_session import get_session_manager, start_persistent_session, get_bearer_token
 from token_manager import get_token_manager, get_valid_token
 from dynamodb_manager import get_dynamodb_manager, initialize_dynamodb_manager
+from profile_database_manager import get_profile_database_manager, initialize_profile_database_manager
+from profile_data_mapper import LinkedInProfileMapper
 import tempfile
 from dotenv import load_dotenv
 
@@ -36,6 +38,7 @@ app.add_middleware(
 session_started: bool = False
 startup_lock = threading.Lock()
 dynamodb_initialized: bool = False
+profile_database_initialized: bool = False
 
 class LinkedInProfileExtractor:
     def __init__(self, auth_token: str):
@@ -172,6 +175,40 @@ async def ensure_dynamodb_initialized():
     
     return True
 
+async def ensure_profile_database_initialized():
+    """Ensure Profile Database is initialized with credentials"""
+    global profile_database_initialized
+    
+    if not profile_database_initialized:
+        try:
+            # Get credentials from environment variables
+            aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+            aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+            aws_region = os.getenv('AWS_REGION', 'us-east-1')
+            
+            if not aws_access_key_id or not aws_secret_access_key:
+                print("⚠️  AWS credentials not found for Profile Database")
+                print("   Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+                return False
+            
+            # Initialize Profile Database manager
+            initialize_profile_database_manager(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=aws_region,
+                table_name="profile_database"
+            )
+            
+            profile_database_initialized = True
+            print("✅ Profile Database initialized successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize Profile Database: {str(e)}")
+            return False
+    
+    return True
+
 async def get_fresh_token() -> str:
     """Get a fresh Bearer token - simple logic: use token.txt if exists, extract if not"""
     try:
@@ -229,15 +266,22 @@ async def get_fresh_token() -> str:
 async def root():
     return {
         "message": "LinkedIn Profile Extractor API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
             "POST /profile": "Get LinkedIn profile for single email (body: {email: 'user@example.com'})",
-            "POST /profiles/batch": "Batch processing with progress tracking (body: {emails: [...], delay_seconds: 2, stop_on_error: true, save_individual_files: false, save_to_dynamodb: true, long_break_interval: 10, long_break_duration: 10})",
+            "POST /profiles/batch": "Enhanced batch processing with automatic profile_database mapping (body: {emails: [...], delay_seconds: 2, stop_on_error: true, save_individual_files: false, save_to_dynamodb: true, long_break_interval: 10, long_break_duration: 10})",
+            "POST /profile/mapped": "Get LinkedIn profile mapped to profile_database format (body: {email: 'user@example.com', save_to_profile_db: true})",
+            "POST /profile/map-from-linkedin-profiles": "Map existing data from linkedin_profiles to profile_database (body: {email: 'user@example.com', save_to_profile_db: true})",
+            "POST /profiles/batch-map-from-linkedin": "Batch map profiles from linkedin_profiles to profile_database (body: {emails: [...]})",
             "POST /profile/download": "Download single LinkedIn profile as JSON file (body: {email: 'user@example.com'})",
             "GET /health": "Health check",
             "GET /token/status": "Check token status",
             "POST /token/refresh": "Force token refresh (may open browser)",
             "POST /token/manual": "Manually upload Bearer token (body: {token: 'Bearer xyz...'})"
+        },
+        "database_tables": {
+            "linkedin_profiles": "Original API responses (email + timestamp as keys)",
+            "profile_database": "Formatted profiles with mapped structure (id as key)"
         }
     }
 
@@ -250,7 +294,8 @@ async def health_check():
         "session_started": session_started,
         "session_active": manager.is_logged_in if manager else False,
         "token_available": get_bearer_token() is not None,
-        "dynamodb_initialized": dynamodb_initialized
+        "dynamodb_initialized": dynamodb_initialized,
+        "profile_database_initialized": profile_database_initialized
     }
 
 @app.get("/token/status")
@@ -383,18 +428,30 @@ async def get_linkedin_profiles_batch(request: dict):
         
         # Initialize DynamoDB if requested
         dynamodb_manager = None
+        profile_database_manager = None
+        
         if save_to_dynamodb:
             try:
+                # Initialize linkedin_profiles table
                 await ensure_dynamodb_initialized()
                 dynamodb_manager = get_dynamodb_manager()
                 if not dynamodb_manager:
-                    print("⚠️  DynamoDB not available, will skip saving to database")
+                    print("⚠️  DynamoDB not available, will skip saving to linkedin_profiles table")
                     save_to_dynamodb = False
                 else:
-                    print("✅ DynamoDB ready for saving profiles")
+                    print("✅ DynamoDB ready for saving to linkedin_profiles table")
+                
+                # Initialize profile_database table
+                await ensure_profile_database_initialized()
+                profile_database_manager = get_profile_database_manager()
+                if not profile_database_manager:
+                    print("⚠️  Profile Database not available, will skip saving to profile_database table")
+                else:
+                    print("✅ Profile Database ready for saving mapped profiles")
+                
             except Exception as e:
-                print(f"⚠️  DynamoDB initialization failed: {e}")
-                print("   Will continue without saving to database")
+                print(f"⚠️  Database initialization failed: {e}")
+                print("   Will continue without saving to databases")
                 save_to_dynamodb = False
         
         # Get fresh token with automatic refresh
@@ -410,6 +467,10 @@ async def get_linkedin_profiles_batch(request: dict):
             "profiles_replaced": 0,
             "profiles_failed": 0,
             "total_deleted": 0
+        }
+        profile_database_stats = {
+            "profiles_saved": 0,
+            "profiles_failed": 0
         }
         
         # Process each email
@@ -450,23 +511,52 @@ async def get_linkedin_profiles_batch(request: dict):
                 # Save to DynamoDB if requested
                 if save_to_dynamodb and dynamodb_manager:
                     try:
+                        # Save to linkedin_profiles table (original format)
                         save_success = dynamodb_manager.save_profile(result)
                         if save_success:
                             result["saved_to_dynamodb"] = True
                             result["dynamodb_action"] = "saved_and_replaced"
                             dynamodb_stats["profiles_saved"] += 1
                             dynamodb_stats["profiles_replaced"] += 1
-                            print(f"💾 Saved to DynamoDB (replaced existing): {email}")
+                            print(f"💾 Saved to linkedin_profiles table (replaced existing): {email}")
                         else:
                             result["saved_to_dynamodb"] = False
                             result["dynamodb_action"] = "failed"
                             dynamodb_stats["profiles_failed"] += 1
-                            print(f"⚠️  Failed to save to DynamoDB: {email}")
+                            print(f"⚠️  Failed to save to linkedin_profiles table: {email}")
+                            
+                        # Map and save to profile_database table (formatted structure)
+                        if profile_database_manager:
+                            try:
+                                mapped_profile = LinkedInProfileMapper.map_profile_data(result, email)
+                                profile_save_success = profile_database_manager.save_profile(mapped_profile)
+                                
+                                if profile_save_success:
+                                    result["saved_to_profile_database"] = True
+                                    profile_database_stats["profiles_saved"] += 1
+                                    print(f"🗃️  Saved mapped profile to profile_database table: {email}")
+                                else:
+                                    result["saved_to_profile_database"] = False
+                                    profile_database_stats["profiles_failed"] += 1
+                                    print(f"⚠️  Failed to save mapped profile to profile_database table: {email}")
+                                    
+                            except Exception as mapping_error:
+                                result["saved_to_profile_database"] = False
+                                result["profile_database_error"] = str(mapping_error)
+                                profile_database_stats["profiles_failed"] += 1
+                                print(f"❌ Profile mapping/saving error for {email}: {mapping_error}")
+                        else:
+                            result["saved_to_profile_database"] = False
+                            result["profile_database_error"] = "Profile Database manager not available"
+                            
                     except Exception as db_error:
                         result["saved_to_dynamodb"] = False
                         result["dynamodb_action"] = "error"
                         result["dynamodb_error"] = str(db_error)
+                        result["saved_to_profile_database"] = False
+                        result["profile_database_error"] = "DynamoDB error prevented profile database save"
                         dynamodb_stats["profiles_failed"] += 1
+                        profile_database_stats["profiles_failed"] += 1
                         print(f"❌ DynamoDB save error for {email}: {db_error}")
                 
                 # Save individual file if requested
@@ -544,6 +634,7 @@ async def get_linkedin_profiles_batch(request: dict):
                 "long_break_duration": long_break_duration
             },
             "dynamodb_stats": dynamodb_stats if save_to_dynamodb else None,
+            "profile_database_stats": profile_database_stats if save_to_dynamodb else None,
             "results": results,
             "errors": errors
         }
@@ -554,7 +645,9 @@ async def get_linkedin_profiles_batch(request: dict):
         print(f"   • Errors: {len(errors)}")
         print(f"   • Success rate: {summary['success_rate']}%")
         if save_to_dynamodb and dynamodb_stats:
-            print(f"   • DynamoDB: {dynamodb_stats['profiles_saved']} saved/replaced, {dynamodb_stats['profiles_failed']} failed")
+            print(f"   • linkedin_profiles: {dynamodb_stats['profiles_saved']} saved/replaced, {dynamodb_stats['profiles_failed']} failed")
+        if save_to_dynamodb and profile_database_stats:
+            print(f"   • profile_database: {profile_database_stats['profiles_saved']} saved, {profile_database_stats['profiles_failed']} failed")
         print(f"   • Total duration: {summary['processing_duration_human']}")
         print(f"   • Average per email: {summary['average_time_per_email']}s")
         
@@ -606,6 +699,197 @@ async def download_linkedin_profile(request: dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error downloading profile: {str(e)}")
+
+@app.post("/profile/mapped")
+async def get_mapped_linkedin_profile(request: dict):
+    """Get LinkedIn profile mapped to profile_database structure and optionally save"""
+    try:
+        # Extract email from request body
+        email = request.get("email")
+        save_to_profile_db = request.get("save_to_profile_db", True)
+        
+        if not email:
+            raise HTTPException(status_code=400, detail="Email is required in request body")
+        
+        # Get fresh token
+        token = await get_fresh_token()
+        
+        # Create extractor and fetch profile
+        extractor = LinkedInProfileExtractor(token)
+        profile_data = await extractor.fetch_linkedin_profile(email)
+        
+        # Create result structure similar to what's saved in linkedin_profiles
+        result = {
+            "email": email,
+            "success": True,
+            "data": profile_data,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Map the profile data to profile_database structure
+        mapped_profile = LinkedInProfileMapper.map_profile_data(result, email)
+        
+        response = {
+            "success": True,
+            "email": email,
+            "raw_data": profile_data,
+            "mapped_data": mapped_profile,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Save to profile_database if requested
+        if save_to_profile_db:
+            try:
+                await ensure_profile_database_initialized()
+                profile_database_manager = get_profile_database_manager()
+                
+                if profile_database_manager:
+                    # Save the mapped profile to profile_database table
+                    save_success = profile_database_manager.save_profile(mapped_profile)
+                    
+                    response["saved_to_profile_database"] = save_success
+                    
+                    if save_success:
+                        print(f"✅ Mapped profile saved to profile_database table: {email}")
+                    else:
+                        print(f"⚠️  Failed to save mapped profile to profile_database table: {email}")
+                else:
+                    response["saved_to_profile_database"] = False
+                    response["profile_database_error"] = "Profile Database manager not available"
+                    
+            except Exception as db_error:
+                print(f"❌ Profile Database save error for {email}: {db_error}")
+                response["saved_to_profile_database"] = False
+                response["profile_database_error"] = str(db_error)
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching mapped profile: {str(e)}")
+
+@app.post("/profile/map-from-linkedin-profiles")
+async def map_from_linkedin_profiles_table(request: dict):
+    """Map data from linkedin_profiles table to profile_database format"""
+    try:
+        email = request.get("email")
+        if not email:
+            raise HTTPException(status_code=400, detail="Email is required")
+        
+        # Get data from linkedin_profiles table
+        await ensure_dynamodb_initialized()
+        dynamodb_manager = get_dynamodb_manager()
+        if not dynamodb_manager:
+            raise HTTPException(status_code=503, detail="LinkedIn profiles database not available")
+        
+        # Query the linkedin_profiles table
+        profile_record = dynamodb_manager.get_profile(email)
+        
+        if not profile_record:
+            raise HTTPException(status_code=404, detail=f"Profile not found for {email}")
+        
+        # Map the data using your existing structure
+        mapped_profile = LinkedInProfileMapper.map_profile_data(profile_record, email)
+        
+        # Save to profile_database table
+        save_to_profile_db = request.get("save_to_profile_db", True)
+        saved = False
+        
+        if save_to_profile_db:
+            try:
+                await ensure_profile_database_initialized()
+                profile_database_manager = get_profile_database_manager()
+                if profile_database_manager:
+                    saved = profile_database_manager.save_profile(mapped_profile)
+                    if saved:
+                        print(f"✅ Mapped and saved profile from linkedin_profiles to profile_database: {email}")
+            except Exception as e:
+                print(f"❌ Error saving mapped profile: {e}")
+        
+        return {
+            "success": True,
+            "email": email,
+            "original_data": profile_record,
+            "mapped_data": mapped_profile,
+            "saved_to_profile_database": saved,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Mapping error: {str(e)}")
+
+@app.post("/profiles/batch-map-from-linkedin")
+async def batch_map_from_linkedin_profiles(request: dict):
+    """Batch map profiles from linkedin_profiles table to profile_database table"""
+    try:
+        emails = request.get("emails", [])
+        if not emails:
+            raise HTTPException(status_code=400, detail="emails array is required")
+        
+        await ensure_dynamodb_initialized()
+        dynamodb_manager = get_dynamodb_manager()
+        if not dynamodb_manager:
+            raise HTTPException(status_code=503, detail="LinkedIn profiles database not available")
+        
+        await ensure_profile_database_initialized()
+        profile_database_manager = get_profile_database_manager()
+        if not profile_database_manager:
+            raise HTTPException(status_code=503, detail="Profile database not available")
+        
+        results = []
+        errors = []
+        
+        for email in emails:
+            try:
+                # Get from linkedin_profiles table
+                profile_record = dynamodb_manager.get_profile(email)
+                
+                if profile_record:
+                    # Map the data
+                    mapped_profile = LinkedInProfileMapper.map_profile_data(profile_record, email)
+                    
+                    # Save to profile_database table
+                    saved = profile_database_manager.save_profile(mapped_profile)
+                    
+                    results.append({
+                        "email": email,
+                        "success": True,
+                        "mapped": True,
+                        "saved_to_profile_database": saved
+                    })
+                    
+                    print(f"✅ Mapped and saved profile for {email}")
+                else:
+                    errors.append({
+                        "email": email,
+                        "error": "Profile not found in linkedin_profiles table"
+                    })
+                    print(f"❌ Profile not found for {email}")
+                    
+            except Exception as e:
+                errors.append({
+                    "email": email,
+                    "error": str(e)
+                })
+                print(f"❌ Error processing {email}: {e}")
+        
+        return {
+            "success": True,
+            "total_emails": len(emails),
+            "mapped_successfully": len(results),
+            "errors": len(errors),
+            "results": results,
+            "error_details": errors,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch mapping error: {str(e)}")
 
 
 # Add enhanced batch processing endpoints
