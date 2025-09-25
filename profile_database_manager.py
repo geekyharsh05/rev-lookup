@@ -111,15 +111,29 @@ class ProfileDatabaseManager:
             profile_url = mapped_profile.get('url', {}).get('S', '')
             if not profile_url:
                 print("❌ No profile URL found in mapped profile data")
+                print(f"🔍 Mapped profile keys: {list(mapped_profile.keys())}")
                 return False
             
+            print(f"🔄 Converting profile {profile_url} from DynamoDB to native format...")
+            
+            # Convert DynamoDB format to native Python format
+            native_item = self._convert_dynamodb_to_native(mapped_profile)
+            
+            print(f"🔍 Native item keys: {list(native_item.keys())}")
+            print(f"🔍 Native item url: {native_item.get('url', 'NOT FOUND')}")
+            print(f"🔍 Native item name: {native_item.get('name', 'NOT FOUND')}")
+            
             # Save to DynamoDB
-            self.table.put_item(Item=mapped_profile)
+            print(f"💾 Putting item to table {self.table_name}...")
+            self.table.put_item(Item=native_item)
             print(f"✅ Saved mapped profile to profile_database: {profile_url}")
             return True
             
         except Exception as e:
             print(f"❌ Failed to save profile to profile_database: {str(e)}")
+            import traceback
+            print("🔍 Full traceback:")
+            traceback.print_exc()
             return False
     
     def save_batch_profiles(self, mapped_profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -150,8 +164,11 @@ class ProfileDatabaseManager:
                             errors.append({"profile": mapped_profile, "error": "No profile URL found"})
                             continue
                         
+                        # Convert DynamoDB format to native Python format
+                        native_item = self._convert_dynamodb_to_native(mapped_profile)
+                        
                         # Add to batch
-                        batch.put_item(Item=mapped_profile)
+                        batch.put_item(Item=native_item)
                         success_count += 1
                         
                     except Exception as e:
@@ -260,6 +277,54 @@ class ProfileDatabaseManager:
         except Exception as e:
             print(f"❌ Error scanning profiles: {e}")
             return []
+    
+    def _convert_dynamodb_to_native(self, dynamo_item: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert DynamoDB format to native Python format for put_item"""
+        native_item = {}
+        
+        for key, value in dynamo_item.items():
+            if isinstance(value, dict):
+                if 'S' in value:  # String
+                    # Handle empty strings properly
+                    native_item[key] = value['S'] if value['S'] else ""
+                elif 'N' in value:  # Number
+                    try:
+                        native_item[key] = int(value['N'])
+                    except ValueError:
+                        native_item[key] = float(value['N'])
+                elif 'BOOL' in value:  # Boolean
+                    native_item[key] = value['BOOL']
+                elif 'L' in value:  # List
+                    native_item[key] = [self._convert_dynamodb_value(item) for item in value['L']]
+                elif 'M' in value:  # Map
+                    native_item[key] = self._convert_dynamodb_to_native(value['M'])
+                else:
+                    # Unknown format, keep as is
+                    native_item[key] = value
+            else:
+                # Already native format
+                native_item[key] = value
+        
+        return native_item
+    
+    def _convert_dynamodb_value(self, value: Any) -> Any:
+        """Convert a single DynamoDB value to native Python format"""
+        if isinstance(value, dict):
+            if 'S' in value:
+                return value['S']
+            elif 'N' in value:
+                try:
+                    return int(value['N'])
+                except ValueError:
+                    return float(value['N'])
+            elif 'BOOL' in value:
+                return value['BOOL']
+            elif 'L' in value:
+                return [self._convert_dynamodb_value(item) for item in value['L']]
+            elif 'M' in value:
+                return self._convert_dynamodb_to_native(value['M'])
+        
+        return value
 
 # Global instance
 _profile_database_manager = None

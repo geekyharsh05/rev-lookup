@@ -137,9 +137,9 @@ class LinkedInProfileMapper:
                 "memorialized_account": {"BOOL": False},
                 
                 # Snapshot tracking
-                "snapshot_id": {"S": str(uuid.uuid4())},
-                "snapshotid": {"S": str(uuid.uuid4())},
-                "new_snapshot_id": {"S": str(uuid.uuid4())},
+                "snapshot_id": {"S": ""},
+                "snapshotid": {"S": ""},
+                "new_snapshot_id": {"S": ""},
                 
                 # User ID (derived from email)
                 "user_id": {"S": email.replace('@', '_at_').replace('.', '_')}
@@ -525,9 +525,9 @@ class LinkedInProfileMapper:
             "similar_profiles": {"L": []},
             "bio_links": {"L": []},
             "memorialized_account": {"BOOL": False},
-            "snapshot_id": {"S": str(uuid.uuid4())},
-            "snapshotid": {"S": str(uuid.uuid4())},
-            "new_snapshot_id": {"S": str(uuid.uuid4())},
+            "snapshot_id": {"S": ""},
+            "snapshotid": {"S": ""},
+            "new_snapshot_id": {"S": ""},
             "user_id": {"S": email.replace('@', '_at_').replace('.', '_')},
             "error": {"S": error_msg} if error_msg else {}
         }
